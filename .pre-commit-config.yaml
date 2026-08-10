@@ -1,0 +1,42 @@
+# Hooks run on every commit (via pre-commit). Install once with:
+#   uv run pre-commit install
+# The ruff/commitizen tool versions here are pinned and may trail the dev
+# extras in pyproject.toml; bump rev when you bump the toolchain.
+repos:
+  # Generic repo hygiene
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-ast
+      - id: check-toml
+      - id: check-yaml
+      - id: check-added-large-files
+      - id: check-merge-conflict
+      - id: detect-private-key
+
+  # Lint + format with the project's own toolchain (auto-fixes in place)
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.2
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+
+  # Type-check (scoped to src/ by pyproject [tool.mypy].files)
+  - repo: local
+    hooks:
+      - id: mypy
+        name: mypy
+        entry: uv run mypy
+        language: system
+        pass_filenames: false
+        files: ^src/
+
+  # Conventional-commit enforcement (run on the commit message, not files)
+  - repo: https://github.com/commitizen-tools/commitizen
+    rev: v4.17.0
+    hooks:
+      - id: commitizen
+        stages: [commit-msg]
