@@ -24,6 +24,11 @@ logger = logging.getLogger(__name__)
 
 #: Canonical column schema every loader must produce from ``clean()``.
 #: ``raw`` holds any source-specific fields not captured by the common columns.
+#: ``nta_code``/``cdta_code`` are the official 2020 NYC statistical geographies
+#: (DCP). Loaders emit them as NaN when unknown; the enrichment step
+#: (:func:`nyc_apartments_map.processing.enrich.enrich_listings`) fills them via
+#: point-in-polygon against the NTA boundary file. ``nta_code`` is the canonical
+#: join key for the NTA indicators table.
 COMMON_SCHEMA: dict[str, str] = {
     "listing_id": "str",
     "latitude": "float64",
@@ -33,6 +38,8 @@ COMMON_SCHEMA: dict[str, str] = {
     "bathrooms": "float64",
     "neighborhood": "str",
     "borough": "str",
+    "nta_code": "str",  # 2020 NTA code, e.g. "BK0101"; NaN until enrichment
+    "cdta_code": "str",  # CDTA code, e.g. "BK01"; filled from boundary join
     "source": "str",
     "raw": "object",  # dict of extra source-specific fields
 }

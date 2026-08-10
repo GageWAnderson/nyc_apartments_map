@@ -19,6 +19,8 @@ def _good_frame() -> pd.DataFrame:
             "bathrooms": [1.0, 1.0],
             "neighborhood": ["X", "Y"],
             "borough": ["Manhattan", "Brooklyn"],
+            "nta_code": [pd.NA, pd.NA],
+            "cdta_code": [pd.NA, pd.NA],
             "source": ["test", "test"],
             "raw": [{"x": 1}, {"x": 2}],
         }

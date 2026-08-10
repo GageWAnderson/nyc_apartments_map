@@ -13,6 +13,8 @@ import pyarrow.parquet as pq
 from nyc_apartments_map.config import Settings
 from nyc_apartments_map.datasets.base import COMMON_SCHEMA, DatasetLoader
 from nyc_apartments_map.datasets.registry import get_loader_class, iter_loader_classes
+from nyc_apartments_map.processing.aggregate import build_nta_indicators
+from nyc_apartments_map.processing.enrich import enrich_listings
 
 logger = logging.getLogger(__name__)
 
@@ -87,11 +89,17 @@ def normalize(
     )
     logger.info("Normalized %d rows across %d datasets", len(merged), len(frames))
 
+    # Enrich: fill nta_code/cdta_code via point-in-polygon against NTA boundaries.
+    # Skips gracefully (NaN stays) if the boundary file is absent.
+    merged = enrich_listings(merged, settings)
+
     if write:
         settings.normalized_path.parent.mkdir(parents=True, exist_ok=True)
         table = pa.Table.from_pandas(merged, preserve_index=False)
         pq.write_table(table, settings.normalized_path)
         logger.info("Wrote normalized parquet -> %s", settings.normalized_path)
+        # Aggregate listing-derived metrics per NTA -> nta_indicators.parquet.
+        build_nta_indicators(merged, settings)
 
     return merged
 

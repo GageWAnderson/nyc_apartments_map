@@ -84,6 +84,10 @@ class SampleNYCListings(DatasetLoader):
                 "bathrooms": raw_df["bathrooms"].astype("float64"),
                 "neighborhood": raw_df["neighborhood"].astype(str),
                 "borough": raw_df["borough"].astype(str),
+                # Free-text neighborhoods aren't keyed to official NTAs — emit NA
+                # so the enrichment step (point-in-polygon) fills these in.
+                "nta_code": pd.NA,
+                "cdta_code": pd.NA,
                 "source": self.name,
                 "raw": raw_df.apply(lambda r: r.to_dict(), axis=1),
             }

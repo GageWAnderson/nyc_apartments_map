@@ -71,10 +71,19 @@ Every loader's `clean()` must produce these columns:
 | `price`       | float   | monthly rent or sale price         |
 | `bedrooms`    | float   | nullable                           |
 | `bathrooms`   | float   | nullable                           |
-| `neighborhood`| str     | nullable                           |
+| `neighborhood`| str     | nullable (free-text display)        |
 | `borough`     | str     | nullable                           |
+| `nta_code`    | str     | 2020 NTA code (e.g. `BK0101`); NaN until enrichment |
+| `cdta_code`   | str     | CDTA code (e.g. `BK01`); NaN until enrichment |
 | `source`      | str     | set automatically to `loader.name` |
 | `raw`         | dict    | extra source-specific fields       |
+
+`nta_code`/`cdta_code` are the canonical NYC Neighborhood Tabulation Area
+geographies (DCP 2020). Loaders emit them as NaN; the `process` step fills them
+via point-in-polygon against `data/raw/ntas/ntas.json`. `nta_code` is the join
+key for `data/processed/nta_indicators.parquet` (one row per NTA, listing-derived
+metrics). If the boundary file is absent, enrichment skips with a warning and
+the columns stay NaN.
 
 ## Project layout
 
@@ -88,7 +97,9 @@ src/nyc_apartments_map/
     _template.py       # copy-and-go template (not registered)
     sample_nyc_listings.py  # runnable synthetic dataset
   processing/normalize.py   # clean + merge -> parquet
-  geo/                 # NYC bounds + CRS
+  processing/enrich.py      # NTA/CDTA assignment via point-in-polygon
+  processing/aggregate.py   # NTA indicators table (one row per NTA)
+  geo/                 # NYC bounds + CRS + NTA boundaries
   map/builder.py       # Folium/Leaflet map builder
 scripts/               # thin CLI wrappers (fetch_data, process_data, build_map)
 tests/                 # registry + normalize tests
@@ -102,6 +113,9 @@ outputs/   maps/                       # gitignored, regenerated
   when files exist unless `--force` is passed (existence-only validation).
 - The merged normalized table is written to `data/processed/normalized.parquet`
   (pyarrow), so `build-map` can re-render without re-cleaning.
+- NTA indicators (listing-derived metrics per NTA) are written to
+  `data/processed/nta_indicators.parquet`. CDTA/borough roll-ups derive on
+  demand from NTA (2020 NTA codes embed their CDTA in the first 4 chars).
 
 ## Quality checks
 

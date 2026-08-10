@@ -28,6 +28,11 @@ class Settings(BaseSettings):
     outputs_dir: Path = _PROJECT_ROOT / "outputs"
     maps_dir: Path = _PROJECT_ROOT / "outputs" / "maps"
     normalized_path: Path = _PROJECT_ROOT / "data" / "processed" / "normalized.parquet"
+    # 2020 NTA boundary GeoJSON (DCP "Bytes of the Big Apple"). Enrichment reads
+    # this for point-in-polygon assignment; absence is non-fatal (skips + warns).
+    nta_boundaries_path: Path = _PROJECT_ROOT / "data" / "raw" / "ntas" / "ntas.json"
+    # Listing-derived metrics per NTA (one row per NTA, keyed by nta_code).
+    nta_indicators_path: Path = _PROJECT_ROOT / "data" / "processed" / "nta_indicators.parquet"
     default_map_path: Path = _PROJECT_ROOT / "outputs" / "maps" / "nyc_apartments.html"
 
     def ensure_dirs(self) -> None:

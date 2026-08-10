@@ -54,6 +54,12 @@ uv run pytest -q
   raises `ValueError`. `source` is auto-set to the loader name if missing or
   all-NaN (so it can be omitted). Numeric cols are coerced; rows missing
   `latitude`/`longitude` are silently dropped.
+- `nta_code`/`cdta_code` are 2020 NTA/CDTA codes (DCP). Loaders emit them as
+  NaN; `process` fills them via point-in-polygon against
+  `data/raw/ntas/ntas.json`. If the boundary file is absent, enrichment skips
+  with a warning (columns stay NaN) — the pipeline does NOT hard-fail.
+  `nta_code` is the join key for `data/processed/nta_indicators.parquet`.
+  `nta_name`/`cdta_name` live in boundaries + indicators (NOT on listings).
 
 ## Config / env
 

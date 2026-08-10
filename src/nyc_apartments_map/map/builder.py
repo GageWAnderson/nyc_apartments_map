@@ -119,9 +119,12 @@ def build_map(
             popup_html = (
                 f"<b>{row.get('neighborhood', '')}, {row.get('borough', '')}</b><br>"
                 f"Price: ${price:,.0f}<br>"
-                f"Beds: {row.get('bedrooms', 'n/a')} | "
+                f"Beds: {row.get('bedrooms', 'n/a')} | <br>"
                 f"Baths: {row.get('bathrooms', 'n/a')}<br>"
                 f"Source: {source}<br>"
+                f"neighborhood: {row.get('neighborhood', 'n/a')}<br>"
+                f"NTA Code: {row.get('nta_code', 'n/a')}<br>"
+                f"CDTA Code: {row.get('cdta_code', 'n/a')}<br>"
                 f"ID: {row.get('listing_id', '')}"
             )
             folium.CircleMarker(
