@@ -109,3 +109,41 @@ def test_assign_nta_nan_coords_excluded() -> None:
     out = assign_nta(df, gdf)
     assert pd.isna(out.loc[0, "nta_code"])
     assert out.loc[1, "nta_code"] == "AA0101"
+
+
+def test_assign_nta_overlapping_polygons() -> None:
+    """A point within multiple overlapping NTA polygons gets exactly one code.
+
+    Real NTA boundaries overlap slightly (e.g. BK0202/BK0261); ``gpd.sjoin``
+    returns a row per match, so ``assign_nta`` must deduplicate to avoid a
+    length-mismatch ValueError when writing back to the frame.
+    """
+    import geopandas as gpd
+
+    poly_a = Polygon([(0, 0), (0, 2), (2, 2), (2, 0)])
+    poly_b = Polygon([(1, 0), (1, 2), (3, 2), (3, 0)])
+    gdf = gpd.GeoDataFrame(
+        {
+            "nta_code": ["AA0101", "BB0201"],
+            "nta_name": ["Area A", "Area B"],
+            "nta_type": ["0", "0"],
+            "cdta_code": ["AA01", "BB02"],
+            "cdta_name": ["CDTA A", "CDTA B"],
+        },
+        geometry=[poly_a, poly_b],
+        crs="EPSG:4326",
+    )
+    df = pd.DataFrame(
+        {
+            "latitude": [1.0, 0.5],
+            "longitude": [1.5, 0.5],
+            "nta_code": [pd.NA, pd.NA],
+            "cdta_code": [pd.NA, pd.NA],
+        }
+    )
+    out = assign_nta(df, gdf)
+    # The point at (1.5, 1.0) falls in both overlapping polygons; should get
+    # exactly one NTA code (the first match), not raise.
+    assert pd.notna(out.loc[0, "nta_code"])
+    assert out.loc[0, "nta_code"] in ("AA0101", "BB0201")
+    assert out.loc[1, "nta_code"] == "AA0101"

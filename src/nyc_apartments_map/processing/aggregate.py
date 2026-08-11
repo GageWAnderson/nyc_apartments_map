@@ -52,11 +52,13 @@ def build_nta_indicators(listings: pd.DataFrame, settings: Settings) -> pd.DataF
         pct_missing_bedrooms=("bedrooms_missing", "mean"),
     )
 
-    # Join boundary metadata so the table is self-describing.
+    # Join boundary metadata so the table is self-describing, and attach
+    # contextual point-source metrics per NTA (Strategy A). Both are skipped
+    # when the boundary file is absent (no polygons -> no metadata, no PIP).
     if not settings.nta_boundaries_path.exists():
         logger.warning(
             "NTA boundary file not found at %s — indicators will lack "
-            "nta_name/nta_type/cdta_* columns.",
+            "nta_name/nta_type/cdta_* columns and point-source metrics.",
             settings.nta_boundaries_path,
         )
     else:
@@ -71,6 +73,20 @@ def build_nta_indicators(listings: pd.DataFrame, settings: Settings) -> pd.DataF
             }
         )
         agg = meta.merge(agg, on="nta_code", how="left")
+
+        from nyc_apartments_map.processing import geo_sources
+
+        metric_cols: list[str] = []
+        for fn in geo_sources.POINT_SOURCE_FUNCS:
+            metrics = fn(settings, boundaries=boundaries)
+            if metrics.empty:
+                continue
+            metric_cols.extend(c for c in metrics.columns if c != "nta_code")
+            agg = agg.merge(metrics, on="nta_code", how="left")
+        # Point-source metrics are non-negative integer counts/sums; NTAs with
+        # no matched points get NaN from the left join -> coerce to 0.
+        for c in metric_cols:
+            agg[c] = agg[c].fillna(0).astype("int64")
 
     agg["listing_count"] = agg["listing_count"].fillna(0).astype("int64")
 

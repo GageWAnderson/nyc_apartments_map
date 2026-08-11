@@ -9,7 +9,9 @@ from typing import Any
 
 import branca.colormap as cm
 import folium
+import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 
 from nyc_apartments_map.config import Settings
 from nyc_apartments_map.geo import NYC_CENTER
@@ -67,24 +69,67 @@ def _add_referrer_meta(fmap: folium.Map) -> None:
     fmap.get_root().header.add_child(folium.Element(meta))  # type: ignore[attr-defined]
 
 
-def _load_nta_overlay(settings: Settings) -> dict[str, Any] | None:
-    """Load and simplify NTA boundaries for inline embedding as a Leaflet GeoJson layer.
+def _load_nta_indicators(settings: Settings) -> pd.DataFrame | None:
+    """Read ``nta_indicators.parquet``; return ``None`` (and warn) if absent.
 
-    Reuses :func:`load_nta_boundaries` (canonical rename + WGS84 normalization),
-    then applies topology-preserving simplification to shrink the embedded
-    payload. Returns ``None`` (and warns) if the boundary file is absent so
-    map builds remain non-fatal without it, mirroring ``processing/enrich.py``.
+    Non-fatal so map builds still succeed without the indicators parquet,
+    mirroring the boundary-file pattern in ``processing/enrich.py``.
+    """
+    if not settings.nta_indicators_path.exists():
+        logger.warning(
+            "NTA indicators not found at %s; skipping choropleth layers.",
+            settings.nta_indicators_path,
+        )
+        return None
+    return pq.read_table(settings.nta_indicators_path).to_pandas()  # type: ignore[no-any-return]
+
+
+#: NTA boundary metadata columns carried by ``load_nta_boundaries``; excluded
+#: from per-NTA indicator metric columns to avoid duplicating them when the
+#: indicators parquet is merged onto the GeoJSON properties.
+_NTA_META_COLS = {"nta_name", "nta_type", "cdta_code", "cdta_name"}
+
+
+def _build_enriched_nta_geojson(
+    settings: Settings,
+) -> tuple[dict[str, Any] | None, list[str]]:
+    """Build NTA GeoJSON with indicator metrics merged into feature properties.
+
+    Returns ``(geojson, metric_cols)``. ``geojson`` is a FeatureCollection
+    whose feature ``properties`` carry ``nta_code``, ``nta_name``, and every
+    numeric indicator column from ``nta_indicators.parquet`` (NaN -> ``None``).
+    ``metric_cols`` is the list of numeric indicator columns (one choropleth
+    layer is built per entry).
+
+    Returns ``(None, [])`` (and warns) if the boundary file is absent. If the
+    indicators parquet is absent, the GeoJSON still carries boundary metadata
+    but ``metric_cols`` is empty (no choropleth layers).
     """
     if not settings.nta_boundaries_path.exists():
         logger.warning(
-            "NTA boundary file not found at %s; skipping NTA overlay layer.",
+            "NTA boundary file not found at %s; skipping NTA overlay + choropleth layers.",
             settings.nta_boundaries_path,
         )
-        return None
+        return None, []
+
     gdf = load_nta_boundaries(settings).copy()
+    metric_cols: list[str] = []
+    indicators = _load_nta_indicators(settings)
+    if indicators is not None:
+        # Merge indicators onto boundaries; drop duplicate metadata columns
+        # so the GeoJSON properties carry each field exactly once.
+        dup_cols = [c for c in _NTA_META_COLS if c in indicators.columns]
+        ind_no_meta = indicators.drop(columns=dup_cols)
+        gdf = gdf.merge(ind_no_meta, on="nta_code", how="left")
+        metric_cols = [
+            c
+            for c in ind_no_meta.columns
+            if c != "nta_code" and pd.api.types.is_numeric_dtype(indicators[c])
+        ]
+
     gdf.geometry = gdf.geometry.simplify(_NTA_SIMPLIFY_TOL, preserve_topology=True)
     geojson = json.loads(gdf.to_json())
-    return geojson  # type: ignore[no-any-return]
+    return geojson, metric_cols
 
 
 def _price_color_scale(min_price: float, max_price: float) -> cm.LinearColormap:
@@ -93,6 +138,55 @@ def _price_color_scale(min_price: float, max_price: float) -> cm.LinearColormap:
         max_price = min_price + 1.0
     scale = cm.linear.YlOrRd_09.scale(min_price, max_price)  # type: ignore[attr-defined]
     return scale  # type: ignore[no-any-return]
+
+
+#: Style applied to NTA polygons with no data for the active metric (NaN).
+_NAN_STYLE: dict[str, Any] = {
+    "fillColor": "#cccccc",
+    "fillOpacity": 0.08,
+    "color": "#888888",
+    "weight": 0.5,
+}
+
+
+def _make_choropleth_style(metric: str, values: pd.Series) -> Any:
+    """Build a bound ``style_function`` for one metric's choropleth layer.
+
+    Count data is highly skewed (e.g. hpd_violation_count ranges 0..97463),
+    so a naive linear scale would render most NTAs identically. We clamp the
+    colormap domain to the 1st/99th percentile so the bulk of NTAs are
+    distinguishable; values beyond the domain are clamped by
+    ``LinearColormap.rgb_hex_str`` automatically. NaN/None values fall back to
+    :data:`_NAN_STYLE`.
+
+    The returned style_function uses a default argument to bind the loop
+    variable (classic closure gotcha) so each metric gets its own colormap.
+    """
+    vals = values.dropna()
+    if vals.empty:
+        lo, hi = 0.0, 1.0
+    else:
+        lo, hi = float(np.nanpercentile(vals, 1)), float(np.nanpercentile(vals, 99))
+        if hi <= lo:
+            hi = lo + 1.0
+    colormap = cm.linear.YlOrRd_09.scale(lo, hi)  # type: ignore[attr-defined]
+
+    def style_fn(
+        feature: dict[str, Any],
+        m: str = metric,
+        cmap: cm.LinearColormap = colormap,
+    ) -> dict[str, Any]:
+        v = feature["properties"].get(m)
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return dict(_NAN_STYLE)
+        return {
+            "fillColor": cmap.rgb_hex_str(float(v)),
+            "fillOpacity": 0.6,
+            "color": "#888888",
+            "weight": 0.5,
+        }
+
+    return style_fn
 
 
 def _marker_radius(price: float, p_min: float, p_max: float) -> float:
@@ -133,22 +227,57 @@ def build_map(
     _add_osm_tilelayer(fmap)
     _add_referrer_meta(fmap)
 
-    # NTA boundary polygons as a toggleable reference overlay. Added before the
-    # marker layers so listing markers render on top of the polygons.
-    nta_geojson = _load_nta_overlay(settings)
+    # NTA boundary polygons with per-NTA indicator metrics merged in. The
+    # reference layer is on by default; one choropleth layer per metric is
+    # added (all off by default) so the user toggles them via LayerControl.
+    # Added before the marker layers so listing markers render on top.
+    nta_geojson, metric_cols = _build_enriched_nta_geojson(settings)
     if nta_geojson is not None:
+        # Tooltip config: hovering any NTA shows its name, code, and every
+        # indicator value, regardless of which choropleth layer is active.
+        # A FRESH GeoJsonTooltip instance is created per layer below — folium's
+        # GeoJsonTooltip is a MacroElement that renders a top-level
+        # ``<var>.bindTooltip()`` call referencing its owning layer's variable.
+        # Reusing one instance across N layers makes that call reference a var
+        # defined later in the HTML, throwing "undefined" and breaking all JS
+        # (including the LayerControl). Each layer needs its own instance.
+        tooltip_fields = ["nta_name", "nta_code", *metric_cols]
+        tooltip_aliases = ["NTA", "Code", *[c for c in metric_cols]]
+
+        def _new_tooltip() -> folium.GeoJsonTooltip:
+            return folium.GeoJsonTooltip(
+                fields=tooltip_fields,
+                aliases=tooltip_aliases,
+                localize=True,
+                sticky=True,
+            )
+
+        # Reference overlay: neutral thin-border style, on by default. Reuses
+        # the enriched geojson so its tooltip also surfaces indicator values.
         folium.GeoJson(
             nta_geojson,
             name="NTA boundaries",
             style_function=lambda _f: {"color": "#3388ff", "weight": 1, "fillOpacity": 0.03},
             highlight_function=lambda _f: {"weight": 2, "fillOpacity": 0.10},
-            tooltip=folium.GeoJsonTooltip(
-                fields=["nta_name", "nta_code"],
-                aliases=["NTA", "Code"],
-                localize=False,
-            ),
+            tooltip=_new_tooltip(),
             show=True,
         ).add_to(fmap)
+
+        # Per-metric choropleth layers, all OFF by default. No colorbar
+        # legends: branca colormaps share Leaflet's `.legend` control and
+        # overlap when stacked, so exact values come from the tooltip instead.
+        indicators = _load_nta_indicators(settings)
+        if indicators is not None:
+            for metric in metric_cols:
+                style_fn = _make_choropleth_style(metric, indicators[metric])
+                folium.GeoJson(
+                    nta_geojson,
+                    name=f"NTA: {metric}",
+                    style_function=style_fn,
+                    highlight_function=lambda _f: {"weight": 2, "fillOpacity": 0.8},
+                    tooltip=_new_tooltip(),
+                    show=False,
+                ).add_to(fmap)
 
     p_min = float(df["price"].min()) if not df.empty else 0.0
     p_max = float(df["price"].max()) if not df.empty else 1.0

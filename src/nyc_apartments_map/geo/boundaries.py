@@ -84,6 +84,10 @@ def assign_nta(df: pd.DataFrame, boundaries: gpd.GeoDataFrame) -> pd.DataFrame:
         how="left",
         predicate="within",
     )
+    # Real NTA boundaries overlap slightly near shared edges; a point may fall
+    # within multiple polygons, producing duplicate rows from sjoin. Keep the
+    # first match so the result has one row per input point.
+    joined = joined[~joined.index.duplicated(keep="first")]
 
     unmatched = int(joined["nta_code"].isna().sum())
     if unmatched:
