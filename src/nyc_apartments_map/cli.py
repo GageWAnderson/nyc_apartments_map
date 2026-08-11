@@ -10,6 +10,7 @@ import typer
 
 from nyc_apartments_map.config import Settings
 from nyc_apartments_map.datasets.registry import discover_loaders
+from nyc_apartments_map.eda.core import run_eda
 from nyc_apartments_map.map.builder import build_map
 from nyc_apartments_map.processing.normalize import normalize
 
@@ -80,6 +81,24 @@ def fetch(
         loader = targets[name](settings=settings)
         path = loader.fetch(force=force)
         typer.echo(f"fetched {name} -> {path}")
+
+
+@app.command("eda")
+def eda(
+    out_dir: Annotated[
+        Path | None,
+        typer.Option("--out", "-o", help="Output directory. Default: data/output/eda."),
+    ] = None,
+    verbose: Annotated[bool, typer.Option("--verbose", "-v")] = False,
+) -> None:
+    """Generate an exploratory-data-analysis report per raw CSV/JSON file."""
+    _setup_logging(verbose)
+    settings = Settings()
+    paths = run_eda(out_dir=out_dir, settings=settings)
+    if not paths:
+        typer.echo("No CSV/JSON files found under data/raw.", err=True)
+        raise typer.Exit(1)
+    typer.echo(f"wrote {len(paths)} report(s) -> {paths[-1].parent}")
 
 
 @app.command("process")

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
+from typing import Any
 
 import branca.colormap as cm
 import folium
@@ -11,6 +13,7 @@ import pandas as pd
 
 from nyc_apartments_map.config import Settings
 from nyc_apartments_map.geo import NYC_CENTER
+from nyc_apartments_map.geo.boundaries import load_nta_boundaries
 from nyc_apartments_map.processing.normalize import load_normalized
 
 logger = logging.getLogger(__name__)
@@ -26,6 +29,11 @@ OSM_TILES_URL = "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
 OSM_TILES_ATTR = (
     '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
 )
+
+#: Simplification tolerance (degrees) for NTA polygons embedded in the map
+#: HTML. ~0.0005 deg (~55 m) shrinks the inline GeoJSON from ~4.5 MB to
+#: ~0.34 MB while preserving visible boundaries at city zoom.
+_NTA_SIMPLIFY_TOL = 0.0005
 
 
 def _add_osm_tilelayer(fmap: folium.Map) -> None:
@@ -57,6 +65,26 @@ def _add_referrer_meta(fmap: folium.Map) -> None:
     """
     meta = f'<meta name="referrer" content="{REFERRER_POLICY}">'
     fmap.get_root().header.add_child(folium.Element(meta))  # type: ignore[attr-defined]
+
+
+def _load_nta_overlay(settings: Settings) -> dict[str, Any] | None:
+    """Load and simplify NTA boundaries for inline embedding as a Leaflet GeoJson layer.
+
+    Reuses :func:`load_nta_boundaries` (canonical rename + WGS84 normalization),
+    then applies topology-preserving simplification to shrink the embedded
+    payload. Returns ``None`` (and warns) if the boundary file is absent so
+    map builds remain non-fatal without it, mirroring ``processing/enrich.py``.
+    """
+    if not settings.nta_boundaries_path.exists():
+        logger.warning(
+            "NTA boundary file not found at %s; skipping NTA overlay layer.",
+            settings.nta_boundaries_path,
+        )
+        return None
+    gdf = load_nta_boundaries(settings).copy()
+    gdf.geometry = gdf.geometry.simplify(_NTA_SIMPLIFY_TOL, preserve_topology=True)
+    geojson = json.loads(gdf.to_json())
+    return geojson  # type: ignore[no-any-return]
 
 
 def _price_color_scale(min_price: float, max_price: float) -> cm.LinearColormap:
@@ -104,6 +132,23 @@ def build_map(
     fmap = folium.Map(location=NYC_CENTER, zoom_start=11, tiles=False)  # type: ignore[arg-type]
     _add_osm_tilelayer(fmap)
     _add_referrer_meta(fmap)
+
+    # NTA boundary polygons as a toggleable reference overlay. Added before the
+    # marker layers so listing markers render on top of the polygons.
+    nta_geojson = _load_nta_overlay(settings)
+    if nta_geojson is not None:
+        folium.GeoJson(
+            nta_geojson,
+            name="NTA boundaries",
+            style_function=lambda _f: {"color": "#3388ff", "weight": 1, "fillOpacity": 0.03},
+            highlight_function=lambda _f: {"weight": 2, "fillOpacity": 0.10},
+            tooltip=folium.GeoJsonTooltip(
+                fields=["nta_name", "nta_code"],
+                aliases=["NTA", "Code"],
+                localize=False,
+            ),
+            show=True,
+        ).add_to(fmap)
 
     p_min = float(df["price"].min()) if not df.empty else 0.0
     p_max = float(df["price"].max()) if not df.empty else 1.0
