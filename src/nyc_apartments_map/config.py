@@ -35,6 +35,19 @@ class Settings(BaseSettings):
     nta_indicators_path: Path = _PROJECT_ROOT / "data" / "processed" / "nta_indicators.parquet"
     default_map_path: Path = _PROJECT_ROOT / "outputs" / "maps" / "nyc_apartments.html"
 
+    # Google Maps API key. First env-var field in Settings — activates the
+    # previously-dormant env_file loader (pydantic-settings reads GOOGLE_API_KEY
+    # from .env case-insensitively). None -> distance metrics skip gracefully.
+    google_api_key: str | None = None
+    # YAML file defining distance-from-address metrics (one section per metric).
+    # Each entry produces two columns on nta_indicators.parquet: <name>_m and
+    # <name>_s. Absence is non-fatal (skips with a warning).
+    distance_metrics_config_path: Path = _PROJECT_ROOT / "configs" / "distance_metrics.yaml"
+    # Cache dir for raw Google Distance Matrix + Geocoding JSON responses.
+    # Honors Google ToS: route cache is re-used only within 30 days of the
+    # fetch timestamp recorded inside each cache file.
+    distance_cache_dir: Path = _PROJECT_ROOT / "data" / "raw" / "distance_from_address"
+
     def ensure_dirs(self) -> None:
         """Create all working directories if they don't yet exist."""
         for path in (

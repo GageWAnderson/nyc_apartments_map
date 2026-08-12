@@ -88,6 +88,21 @@ def build_nta_indicators(listings: pd.DataFrame, settings: Settings) -> pd.DataF
         for c in metric_cols:
             agg[c] = agg[c].fillna(0).astype("int64")
 
+        # Distance-from-address metrics (float meters/seconds per NTA). Unlike
+        # point-source counts, these stay float and keep NaN for NTAs with no
+        # route -- coercing to 0 would imply "zero distance" which is wrong.
+        from nyc_apartments_map.processing import distance_metrics
+
+        distance_cols: list[str] = []
+        for fn in distance_metrics.DISTANCE_METRIC_FUNCS:
+            metrics = fn(settings, boundaries=boundaries)
+            if metrics.empty:
+                continue
+            distance_cols.extend(c for c in metrics.columns if c != "nta_code")
+            agg = agg.merge(metrics, on="nta_code", how="left")
+        for c in distance_cols:
+            agg[c] = pd.to_numeric(agg[c], errors="coerce")
+
     agg["listing_count"] = agg["listing_count"].fillna(0).astype("int64")
 
     settings.nta_indicators_path.parent.mkdir(parents=True, exist_ok=True)

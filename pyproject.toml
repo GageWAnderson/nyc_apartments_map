@@ -19,6 +19,7 @@ dependencies = [
     "typer>=0.12",
     "pydantic-settings>=2.3",
     "python-dotenv>=1.0",
+    "pyyaml>=6.0",
 ]
 
 [project.optional-dependencies]
@@ -55,7 +56,7 @@ strict = true
 files = ["src"]
 
 [[tool.mypy.overrides]]
-module = ["pyarrow", "pyarrow.*", "branca.*", "folium", "geopandas", "geopandas.*", "shapely", "shapely.*", "matplotlib", "matplotlib.*"]
+module = ["pyarrow", "pyarrow.*", "branca.*", "folium", "geopandas", "geopandas.*", "shapely", "shapely.*", "matplotlib", "matplotlib.*", "yaml", "yaml.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

@@ -1,0 +1,48 @@
+# Distance-from-address NTA metrics, computed via the Google Maps Distance
+# Matrix API. Each entry below produces two float columns on
+# data/processed/nta_indicators.parquet, keyed by nta_code:
+#   - <name>_m  : travel distance in meters
+#   - <name>_s  : travel duration in seconds
+#
+# Origins are NTA representative points (geometry.representative_point, which is
+# guaranteed to fall inside the polygon). The destination is geocoded once per
+# metric via the Google Geocoding API and reused for all origins.
+#
+# Required fields:
+#   name        : column-name slug (must be a valid identifier; produces <name>_m / <name>_s)
+#   destination: free-text address string (Google geocodes it)
+# Optional fields:
+#   mode         : driving | walking | bicycling | transit  (default: transit)
+#   departure_time: "now", or "next_<weekday>_<HH:MM>" (e.g. "next_monday_09:00").
+#                   When omitted, Google returns a duration independent of
+#                   traffic (recommended for transit/walking, less meaningful
+#                   for driving).
+#   units        : metric | imperial  (default: metric; always converts to meters/seconds)
+#
+# Google Maps Distance Matrix limits: 100 elements per call, 1000 elements/sec.
+# ~250 NTAs x 1 destination = 250 elements -> 3 batched calls per metric.
+#
+# To disable: delete this file, or set `metrics: []`. The pipeline skips
+# gracefully (logged warning) when the config is absent or the API key is unset.
+
+metrics:
+  - name: distance_from_times_square
+    destination: "Times Square, New York, NY"
+    mode: transit
+    departure_time: "next_monday_09:00"
+    units: metric
+  - name: distance_from_hudson_yards
+    destination: "Hudson Yards, New York, NY"
+    mode: transit
+    departure_time: "next_monday_09:00"
+    units: metric
+  - name: distance_from_west_village
+    destination: "West Village, New York, NY"
+    mode: transit
+    departure_time: "next_friday_18:00"
+    units: metric
+  - name: distance_from_les
+    destination: "Lower East Side, New York, NY"
+    mode: transit
+    departure_time: "next_friday_22:00"
+    units: metric
