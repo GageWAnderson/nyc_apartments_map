@@ -1,0 +1,40 @@
+# Composite desirability score weights for per-NTA ranking.
+#
+# Read by processing/scoring.py. The pipeline derives per-1k-residential-unit
+# rate metrics from the raw NTA indicator counts, percentile-ranks each metric
+# to [0, 1] across residential NTAs (nta_type == "0"), flips "lower is better"
+# metrics, then computes sub-scores and a single composite desirability_score.
+# Each sub-score and the composite are written as new columns in
+# nta_indicators.parquet and appear as toggleable choropleth layers on the map.
+#
+# `direction` controls how a metric's rank maps to desirability:
+#   higher: larger raw value is more desirable (e.g. nightlife density)
+#   lower:  smaller raw value is more desirable (e.g. crime rate)
+#
+# Within each sub-score, metric weights are renormalized over the metrics
+# available for each NTA, so an NTA missing one metric is not penalized. A
+# sub-score with no available metrics is imputed as 0.5 (neutral) for the
+# composite; an NTA with no available sub-scores at all gets NaN (renders gray).
+
+composite:
+  affordability: 0.30
+  safety:        0.30
+  quality:       0.20
+  amenity:       0.20
+
+affordability:
+  median_price:         {weight: 0.5, direction: lower}
+  median_price_per_bed: {weight: 0.5, direction: lower}
+
+safety:
+  felony_per_1k_units:    {weight: 0.6, direction: lower}
+  complaint_per_1k_units: {weight: 0.4, direction: lower}
+
+quality:
+  hpd_violation_per_1k_units:      {weight: 0.4, direction: lower}
+  hpd_rent_impairing_per_1k_units: {weight: 0.3, direction: lower}
+  nyc311_per_1k_units:             {weight: 0.3, direction: lower}
+
+amenity:
+  nightlife_per_1k_units: {weight: 0.6, direction: higher}
+  liquor_per_1k_units:    {weight: 0.4, direction: higher}

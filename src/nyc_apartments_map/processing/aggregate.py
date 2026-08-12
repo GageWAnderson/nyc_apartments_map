@@ -105,6 +105,13 @@ def build_nta_indicators(listings: pd.DataFrame, settings: Settings) -> pd.DataF
 
     agg["listing_count"] = agg["listing_count"].fillna(0).astype("int64")
 
+    # Append composite desirability sub-scores + score columns. Non-fatal:
+    # skips (warns) if the weights file or nta_type column is absent, leaving
+    # the indicators table unchanged so map builds still succeed.
+    from nyc_apartments_map.processing.scoring import add_desirability_scores
+
+    agg = add_desirability_scores(agg, settings)
+
     settings.nta_indicators_path.parent.mkdir(parents=True, exist_ok=True)
     table = pa.Table.from_pandas(agg, preserve_index=False)
     pq.write_table(table, settings.nta_indicators_path)

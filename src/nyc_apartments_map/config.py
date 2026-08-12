@@ -33,6 +33,10 @@ class Settings(BaseSettings):
     nta_boundaries_path: Path = _PROJECT_ROOT / "data" / "raw" / "ntas" / "ntas.json"
     # Listing-derived metrics per NTA (one row per NTA, keyed by nta_code).
     nta_indicators_path: Path = _PROJECT_ROOT / "data" / "processed" / "nta_indicators.parquet"
+    # Desirability composite-score weight profile (sub-score + metric weights
+    # with explicit per-metric direction). Read by processing/scoring.py;
+    # absence is non-fatal (scoring skips + warns, mirroring the boundary file).
+    weights_path: Path = _PROJECT_ROOT / "weights.yaml"
     default_map_path: Path = _PROJECT_ROOT / "outputs" / "maps" / "nyc_apartments.html"
 
     # Google Maps API key. First env-var field in Settings — activates the
