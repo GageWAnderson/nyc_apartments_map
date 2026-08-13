@@ -17,6 +17,7 @@ from nyc_apartments_map.config import Settings
 from nyc_apartments_map.geo import NYC_CENTER
 from nyc_apartments_map.geo.boundaries import load_nta_boundaries
 from nyc_apartments_map.processing.normalize import load_normalized
+from nyc_apartments_map.processing.scoring import load_weights
 
 logger = logging.getLogger(__name__)
 
@@ -197,6 +198,117 @@ def _marker_radius(price: float, p_min: float, p_max: float) -> float:
     return 4.0 + frac * 8.0  # 4..12 px
 
 
+#: Static JS for the composite-weight control panel. Dynamic bits
+#: (the folium layer var name + default weights) are injected into a separate
+#: ``window.__SCORE_CONTROL__`` blob by :func:`_add_score_control`, so this
+#: script carries no f-string placeholders and its braces stay literal.
+#:
+#: On click, POSTs the four composite weights to ``/api/scores`` and restyles
+#: the ``desirability_score`` choropleth layer in place with the returned
+#: per-NTA hex colors -- no map reload, so zoom/pan/layer state is preserved.
+#: NaN/missing NTAs fall back to the gray no-data style. Requires the API
+#: server (``nyc-apartments-map api-serve``); under ``file://`` the fetch has
+#: no same-origin backend and the button surfaces the error in the status line.
+_SCORE_CONTROL_JS = """
+<script>
+document.addEventListener('DOMContentLoaded', function() {
+  var cfg = window.__SCORE_CONTROL__;
+  if (!cfg) { return; }
+  var scoreLayer = window[cfg.layerName];
+  if (!scoreLayer) { return; }
+  var d = cfg.defaults || {};
+  var panel = document.createElement('div');
+  panel.style.cssText = 'position:absolute; bottom:50px; right:10px; z-index:1000;'
+    + ' background:#fff; padding:10px 12px; border-radius:6px;'
+    + ' box-shadow:0 1px 5px rgba(0,0,0,0.4); font:12px/1.4 sans-serif; max-width:230px;';
+  function row(name, val) {
+    return '<label style="display:block; margin:3px 0;">' + name
+      + ' <input type="number" id="w-' + name + '" min="0" step="0.05" value="'
+      + (val || 0) + '" style="width:60px; float:right;"></label>';
+  }
+  panel.innerHTML =
+    '<div style="font-weight:600; margin-bottom:6px;">Desirability weights</div>'
+    + row('affordability', d.affordability)
+    + row('safety', d.safety)
+    + row('quality', d.quality)
+    + row('amenity', d.amenity)
+    + '<button id="update-scores-btn" style="margin-top:8px; width:100%;'
+    + ' padding:4px; cursor:pointer;">Update scores</button>'
+    + '<div id="score-status" style="margin-top:4px; color:#666; font-size:11px;"></div>';
+  document.body.appendChild(panel);
+
+  function readWeights() {
+    return {
+      affordability: parseFloat(document.getElementById('w-affordability').value) || 0,
+      safety: parseFloat(document.getElementById('w-safety').value) || 0,
+      quality: parseFloat(document.getElementById('w-quality').value) || 0,
+      amenity: parseFloat(document.getElementById('w-amenity').value) || 0
+    };
+  }
+
+  document.getElementById('update-scores-btn').addEventListener('click', function() {
+    var status = document.getElementById('score-status');
+    status.textContent = 'Updating...';
+    fetch('/api/scores', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(readWeights())
+    }).then(function(r) {
+      if (!r.ok) {
+        return r.json().then(function(e) { throw new Error(e.detail || ('HTTP ' + r.status)); });
+      }
+      return r.json();
+    }).then(function(data) {
+      var scores = data.scores;
+      var updated = 0;
+      scoreLayer.eachLayer(function(l) {
+        var nta = l.feature && l.feature.properties ? l.feature.properties.nta_code : null;
+        var s = scores[nta];
+        if (s) {
+          l.feature.properties.desirability_score = s.desirability_score;
+          Object.keys(s.sub_scores).forEach(function(k) {
+            l.feature.properties[k] = s.sub_scores[k];
+          });
+          l.setStyle({fillColor: s.color, fillOpacity: 0.6, color: '#888888', weight: 0.5});
+          updated++;
+        } else {
+          l.setStyle({fillColor: '#cccccc', fillOpacity: 0.08, color: '#888888', weight: 0.5});
+        }
+      });
+      status.textContent = 'Updated ' + updated + ' NTAs';
+    }).catch(function(err) {
+      // A failed/unsupported POST (e.g. 501 from the static `serve` command,
+      // or a network error under file://) means the API backend isn't up.
+      var msg = err.message || '';
+      var hint = (msg.indexOf('Failed to fetch') >= 0 || /HTTP \d{3}/.test(msg))
+        ? ' -- run `nyc-apartments-map api-serve` to start the API.'
+        : '';
+      status.textContent = 'Error: ' + msg + hint;
+    });
+  });
+});
+</script>
+"""
+
+
+def _add_score_control(
+    fmap: folium.Map, layer_name: str, default_weights: dict[str, float]
+) -> None:
+    """Inject the composite-weight control panel + restyle script into the map.
+
+    Two ``folium.Element`` scripts are added: a tiny dynamic one that sets
+    ``window.__SCORE_CONTROL__`` (the folium layer var name + current default
+    weights from ``weights.yaml``), and the static :data:`_SCORE_CONTROL_JS`
+    that reads it. Keeping the dynamic data in JSON form (via :func:`json.dumps`)
+    avoids f-string brace-escaping in the JS body.
+    """
+    cfg = {"layerName": layer_name, "defaults": default_weights}
+    init = folium.Element(f"<script>window.__SCORE_CONTROL__ = {json.dumps(cfg)};</script>")
+    static = folium.Element(_SCORE_CONTROL_JS)
+    fmap.get_root().html.add_child(init)  # type: ignore[attr-defined]
+    fmap.get_root().html.add_child(static)  # type: ignore[attr-defined]
+
+
 def build_map(
     df: pd.DataFrame | None = None,
     output_path: Path | None = None,
@@ -267,17 +379,29 @@ def build_map(
         # legends: branca colormaps share Leaflet's `.legend` control and
         # overlap when stacked, so exact values come from the tooltip instead.
         indicators = _load_nta_indicators(settings)
+        desirability_layer: folium.GeoJson | None = None
         if indicators is not None:
             for metric in metric_cols:
                 style_fn = _make_choropleth_style(metric, indicators[metric])
-                folium.GeoJson(
+                gj = folium.GeoJson(
                     nta_geojson,
                     name=f"NTA: {metric}",
                     style_function=style_fn,
                     highlight_function=lambda _f: {"weight": 2, "fillOpacity": 0.8},
                     tooltip=_new_tooltip(),
                     show=False,
-                ).add_to(fmap)
+                )
+                gj.add_to(fmap)
+                if metric == "desirability_score":
+                    desirability_layer = gj
+        # Composite-weight control: restyles the desirability_score layer live
+        # via POST /api/scores. Defaults pre-fill from weights.yaml so the
+        # panel's initial state matches the map as built. Skipped when no
+        # desirability_score layer exists (no weights.yaml / no nta_type).
+        if desirability_layer is not None:
+            profile = load_weights(settings)
+            defaults = profile.composite if profile is not None else {}
+            _add_score_control(fmap, desirability_layer.get_name(), defaults)
 
     p_min = float(df["price"].min()) if not df.empty else 0.0
     p_max = float(df["price"].max()) if not df.empty else 1.0

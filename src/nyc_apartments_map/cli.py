@@ -171,11 +171,56 @@ def serve(
     )
     typer.echo(f"Serving {serve_dir} at http://localhost:{port}/")
     typer.echo("Open nyc_apartments.html in your browser. Press Ctrl+C to stop.")
+    typer.echo(
+        "Note: this is a static server; the map's 'Update scores' button needs "
+        "the API server -- run `nyc-apartments-map api-serve` instead."
+    )
     try:
         with socketserver.TCPServer(("127.0.0.1", port), handler) as httpd:
             httpd.serve_forever()
     except KeyboardInterrupt:
         typer.echo("\nStopping server.")
+
+
+@app.command("api-serve")
+def api_serve(
+    port: Annotated[
+        int,
+        typer.Option("--port", "-p", help="Port to serve on."),
+    ] = 8000,
+    host: Annotated[
+        str,
+        typer.Option("--host", help="Host to bind. Default: 127.0.0.1."),
+    ] = "127.0.0.1",
+    reload: Annotated[
+        bool,
+        typer.Option("--reload", help="Auto-reload on source changes (dev only)."),
+    ] = False,
+    verbose: Annotated[bool, typer.Option("--verbose", "-v")] = False,
+) -> None:
+    """Serve the map + scoring API over HTTP (FastAPI + static files).
+
+    Mounts the built map at ``/nyc_apartments.html`` and the JSON API at
+    ``/api/weights`` (GET) and ``/api/scores`` (POST) on a single origin so the
+    map page can re-score NTAs without CORS. Requires the ``api`` extra:
+    ``uv sync --all-extras``.
+    """
+    import uvicorn
+
+    _setup_logging(verbose)
+    typer.echo(f"Serving map + API at http://{host}:{port}/")
+    typer.echo(f"  Map: http://{host}:{port}/nyc_apartments.html")
+    typer.echo(f"  API: http://{host}:{port}/api/weights  (GET)")
+    typer.echo(f"       http://{host}:{port}/api/scores   (POST)")
+    typer.echo("Press Ctrl+C to stop.")
+    # factory=True + import string so --reload can re-import on source changes.
+    uvicorn.run(
+        "nyc_apartments_map.api.app:create_app",
+        factory=True,
+        host=host,
+        port=port,
+        reload=reload,
+    )
 
 
 @app.command("run")

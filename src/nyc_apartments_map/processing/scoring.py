@@ -246,17 +246,23 @@ def _compose(
 # --- Public entry point ------------------------------------------------------
 
 
-def add_desirability_scores(agg: pd.DataFrame, settings: Settings) -> pd.DataFrame:
-    """Append sub-score + composite desirability columns to the NTA indicators.
+def score_with_profile(agg: pd.DataFrame, profile: WeightProfile) -> pd.DataFrame:
+    """Append sub-score + composite desirability columns using ``profile``.
 
-    Returns a new DataFrame (the input is not mutated). Non-fatal skips:
-      - weights file absent -> returns ``agg`` unchanged (warns).
-      - ``nta_type`` column absent (no boundary file) -> returns ``agg``
-        unchanged (warns), since residential filtering is impossible.
+    Pure function: no :class:`Settings`, no file I/O. The same math as the
+    pipeline's scoring step, factored out so the API can re-score NTAs from a
+    caller-supplied weight profile without re-running fetch/process. Returns
+    a new DataFrame (the input is not mutated).
+
+    Idempotent: ``derive_rate_columns`` and the sub-score/composite assignments
+    all overwrite in place, so passing a frame that already carries stale
+    ``*_per_1k_units`` / ``*_score`` / ``desirability_score`` columns simply
+    recomputes them from the raw counts -- the indicators parquet can be fed
+    in directly.
+
+    Non-fatal skip: returns ``agg`` unchanged (warns) when ``nta_type`` is
+    absent, since residential filtering is impossible without it.
     """
-    profile = load_weights(settings)
-    if profile is None:
-        return agg
     if "nta_type" not in agg.columns:
         logger.warning("nta_type column absent (no boundary file?); skipping desirability scoring.")
         return agg
@@ -282,3 +288,18 @@ def add_desirability_scores(agg: pd.DataFrame, settings: Settings) -> pd.DataFra
         int(composite.notna().sum()),
     )
     return df
+
+
+def add_desirability_scores(agg: pd.DataFrame, settings: Settings) -> pd.DataFrame:
+    """Append sub-score + composite desirability columns to the NTA indicators.
+
+    Thin wrapper around :func:`score_with_profile` that loads the weight
+    profile from ``settings.weights_path``. Non-fatal: returns ``agg``
+    unchanged (warns) if the weights file is absent. See
+    :func:`score_with_profile` for the scoring math, idempotency notes, and the
+    ``nta_type`` requirement.
+    """
+    profile = load_weights(settings)
+    if profile is None:
+        return agg
+    return score_with_profile(agg, profile)

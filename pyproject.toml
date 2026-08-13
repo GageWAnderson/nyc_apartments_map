@@ -31,6 +31,10 @@ dev = [
     "pre-commit>=3.8",
     "commitizen>=4.0",
 ]
+api = [
+    "fastapi>=0.110",
+    "uvicorn>=0.30",
+]
 
 [project.scripts]
 nyc-apartments-map = "nyc_apartments_map.cli:app"
@@ -56,7 +60,7 @@ strict = true
 files = ["src"]
 
 [[tool.mypy.overrides]]
-module = ["pyarrow", "pyarrow.*", "branca.*", "folium", "geopandas", "geopandas.*", "shapely", "shapely.*", "matplotlib", "matplotlib.*", "yaml", "yaml.*"]
+module = ["pyarrow", "pyarrow.*", "branca.*", "folium", "geopandas", "geopandas.*", "shapely", "shapely.*", "matplotlib", "matplotlib.*", "yaml", "yaml.*", "fastapi", "fastapi.*", "starlette", "starlette.*", "uvicorn", "uvicorn.*", "httpx", "httpx.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
