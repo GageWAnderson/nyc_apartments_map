@@ -445,7 +445,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--scan-end",
         type=_parse_date,
-        default=dt.date(2027, 6, 30),
+        default=dt.date(2027, 4, 30),
         help="Last candidate start date.",
     )
     p.add_argument(
