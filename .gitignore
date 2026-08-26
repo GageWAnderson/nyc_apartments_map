@@ -226,3 +226,6 @@ outputs/maps/
 
 # uv
 uv.lock.tmp
+
+# Output data
+outputs/*
