@@ -103,6 +103,21 @@ def build_nta_indicators(listings: pd.DataFrame, settings: Settings) -> pd.DataF
         for c in distance_cols:
             agg[c] = pd.to_numeric(agg[c], errors="coerce")
 
+        # Pre-aggregated area sources (Furman/ACS) bridged to NTAs via
+        # crosswalk. Like distance metrics, these are continuous values
+        # (dollar rents) and stay float/NaN -- a missing rent is not $0.
+        from nyc_apartments_map.processing import area_sources
+
+        area_cols: list[str] = []
+        for fn in area_sources.AREA_SOURCE_FUNCS:
+            metrics = fn(settings, boundaries=boundaries)
+            if metrics.empty:
+                continue
+            area_cols.extend(c for c in metrics.columns if c != "nta_code")
+            agg = agg.merge(metrics, on="nta_code", how="left")
+        for c in area_cols:
+            agg[c] = pd.to_numeric(agg[c], errors="coerce")
+
     agg["listing_count"] = agg["listing_count"].fillna(0).astype("int64")
 
     # Append composite desirability sub-scores + score columns. Non-fatal:
