@@ -27,6 +27,11 @@ message on commit. To run the full suite manually:
 - Single test: `uv run pytest tests/test_registry.py::test_discover_loaders_finds_sample`.
 - `scripts/*.py` are thin forwarders to the Typer CLI in
   `src/nyc_apartments_map/cli.py` — do **not** add logic there.
+- `src/rental_timing_calculator/` is a standalone PoC (argparse CLI,
+  matplotlib Agg → PNG) that reads `data/processed/normalized.parquet` via
+  `Settings`; PNGs land in `outputs/rental_timing/`. Tests are in
+  `tests/test_rental_timing.py` (math-only; no data I/O). Because the module
+  lives in `src/`, mypy strict applies to it — see "Quality checks".
 
 ## Quality checks
 
