@@ -108,6 +108,21 @@ class ScoreResult:
     dealbreakers_triggered: list[str]
 
 
+@dataclass(frozen=True)
+class BatchRow:
+    """One row of batch output: normalized listing plus score and warnings."""
+
+    address: str
+    url: str
+    price: int | float | None
+    bedrooms: int | float | None
+    layout: str | None
+    total: int
+    breakdown: dict[str, CategoryScore]
+    dealbreakers_triggered: list[str]
+    warnings: list[str]
+
+
 # --------------------------------------------------------------------------- #
 # Normalization helpers
 # --------------------------------------------------------------------------- #
@@ -135,14 +150,21 @@ def floor_from_unit(unit: Any, building_floor_count: int | None) -> int | None:
     if not isinstance(unit, str):
         return None
     text = unit.strip().lstrip("#").upper()
-    digits = re.match(r"\d+", text)
-    if digits:
-        return int(digits.group())
     if text.startswith("PH"):
         ph_digits = re.match(r"PH(\d+)", text)
         if ph_digits:
             return int(ph_digits.group(1))
         return building_floor_count
+    digits = re.match(r"\d+", text)
+    if digits:
+        return int(digits.group())
+    # Letter-prefixed unit: the embedded digit run is the floor ("S20M"->20,
+    # "N10A"->10). Multi-word tower designators ("WEST-TOWER-11B") are excluded
+    # — too ambiguous to parse reliably.
+    if "-" not in text:
+        embedded = re.search(r"(\d+)", text)
+        if embedded:
+            return int(embedded.group(1))
     return None
 
 
@@ -584,6 +606,246 @@ def result_to_dict(result: ScoreResult) -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------- #
+# Batch mode (StreetEasy search-result exports)
+# --------------------------------------------------------------------------- #
+def _split_address_unit(address: str) -> tuple[str, str | None]:
+    """Split "311 11th Avenue #PH308" -> ("311 11th Avenue", "PH308").
+
+    Handles "#"-prefixed units and trailing bare unit tokens after the street
+    (e.g. "500 West 18th Street WEST-TOWER-11B"). The unit string is returned
+    without the leading '#'. When no unit marker is found the whole string is
+    the street and the unit is None.
+    """
+    text = address.strip()
+    if "#" in text:
+        street, _, unit = text.partition("#")
+        return street.strip(), unit.strip() or None
+    # Trailing ALL-CAPS token with digits, e.g. "... Street WEST-TOWER-11B"
+    match = re.match(r"^(.*?)\s+([A-Z][A-Z0-9-]*\d[A-Z0-9-]*)$", text)
+    if match and len(match.group(1)) > 3:
+        return match.group(1).strip(), match.group(2)
+    return text, None
+
+
+# Keys in the StreetEasy search-export shape that are already mapped (or are
+# export-only noise) and therefore excluded from the generic passthrough.
+_EXPORT_KEYS = {
+    "address",
+    "price",
+    "bedrooms",
+    "bathrooms",
+    "squareFeet",
+    "propertyType",
+    "neighborhood",
+    "listingType",
+    "description",
+    "amenities",
+    "buildingName",
+    "agentName",
+    "agentBrokerage",
+    "latitude",
+    "longitude",
+    "daysOnStreetEasy",
+    "maintenanceFee",
+    "taxes",
+    "pricePerSqFt",
+    "status",
+    "yearBuilt",
+    "url",
+}
+
+
+def normalize_search_listing(raw: dict[str, Any]) -> Listing:
+    """Map a StreetEasy search-result export entry onto the scorer's input schema.
+
+    Zero/empty export values mean "unknown" and are omitted so derived flags
+    simply stay false and no dealbreaker fires on absent facts. Fields the
+    export never carries (layout, living_situation, tour judgments) are left
+    out entirely — the batch scorer treats them as null-safe zeros.
+    """
+    listing: Listing = {}
+    address = raw.get("address")
+    if isinstance(address, str) and address.strip():
+        street, unit = _split_address_unit(address)
+        listing["name"] = address.strip()
+        if unit:
+            listing["unit"] = unit
+    for src_key, dst_key in (
+        ("price", "price"),
+        ("bedrooms", "bedrooms"),
+        ("neighborhood", "neighborhood"),
+        ("propertyType", "building_type"),
+    ):
+        value = raw.get(src_key)
+        if isinstance(value, (int, float, str)) and value not in ("", 0):
+            listing[dst_key] = value
+    sqft = raw.get("squareFeet")
+    if isinstance(sqft, (int, float)) and not isinstance(sqft, bool) and sqft > 0:
+        listing["sqft"] = sqft
+    bedrooms = raw.get("bedrooms")
+    if isinstance(bedrooms, (int, float)) and not isinstance(bedrooms, bool) and bedrooms > 0:
+        listing["rooms"] = bedrooms  # approximation: rooms not exported
+    amenities = raw.get("amenities")
+    if isinstance(amenities, list) and amenities:
+        listing["amenities"] = [a for a in amenities if isinstance(a, str)]
+    url = raw.get("url")
+    if isinstance(url, str) and url.strip():
+        listing["source_url"] = url.strip()
+    year_built = raw.get("yearBuilt")
+    if isinstance(year_built, (int, float)) and not isinstance(year_built, bool) and year_built > 0:
+        listing["building_year_built"] = year_built
+    # Pass through any scorer-native fields already present (lets an export be
+    # hand-completed or produced by a richer scraper without losing fields).
+    for key, value in raw.items():
+        if key not in _EXPORT_KEYS and key not in listing:
+            listing[key] = value
+    return listing
+
+
+def _dedupe_key(listing: Listing, raw: dict[str, Any]) -> tuple[str, Any]:
+    """Dedupe key: slugified full address (incl. unit) + price.
+
+    Query params (?featured=1 / ?infeed=1) vary across duplicate exports of the
+    same unit, so the URL is NOT part of the key.
+    """
+    name = listing.get("name", "")
+    price = listing.get("price", raw.get("price"))
+    return _slug(str(name)), price
+
+
+def score_search_listing(raw: dict[str, Any], card: Scorecard) -> BatchRow:
+    """Normalize one search-export entry and score it null-safely.
+
+    Missing/unknown `layout` and `living_situation` score their category as 0
+    and append a warning instead of raising — every exported listing gets a
+    ranked row. The listing's deterministic fields still drive location,
+    access, hygiene, and dealbreakers as usual.
+    """
+    listing = normalize_search_listing(raw)
+    enriched = enrich_listing(listing, card)
+    warnings: list[str] = []
+    breakdown: dict[str, CategoryScore] = {
+        "location": score_location(enriched, card),
+    }
+
+    layout = enriched.get("layout")
+    if isinstance(layout, str) and layout.strip() and _slug(layout) in card.layout_scores:
+        breakdown["unit_function"] = score_unit_function(enriched, card)
+    else:
+        reason = "layout missing/unknown" if not layout else f"unknown layout {layout!r}"
+        breakdown["unit_function"] = CategoryScore(0, [f"{reason} -> 0 (not inferred)"])
+        warnings.append(f"unit_function scored 0: {reason}")
+
+    situation = enriched.get("living_situation")
+    if isinstance(situation, str) and situation.strip() and _slug(situation) in card.control_scores:
+        breakdown["control"] = score_control(enriched, card)
+    else:
+        reason = (
+            "living_situation missing"
+            if not situation
+            else f"unknown living_situation {situation!r}"
+        )
+        breakdown["control"] = CategoryScore(0, [f"{reason} -> 0 (not inferred)"])
+        warnings.append(f"control scored 0: {reason}")
+
+    breakdown["access"] = score_access(enriched, card, card.category_max["access"])
+    breakdown["hygiene_outdoor"] = score_hygiene_outdoor(
+        enriched, card, card.category_max["hygiene_outdoor"]
+    )
+    breakdown = {
+        name: CategoryScore(min(cs.points, card.category_max[name]), cs.reasons)
+        for name, cs in breakdown.items()
+    }
+    total = sum(cs.points for cs in breakdown.values())
+    triggered = triggered_dealbreakers(enriched, card)
+    if triggered and total > card.dealbreaker_cap:
+        total = card.dealbreaker_cap
+
+    return BatchRow(
+        address=str(listing.get("name", raw.get("address", ""))),
+        url=str(listing.get("source_url", "")),
+        price=listing.get("price") if isinstance(listing.get("price"), (int, float)) else None,
+        bedrooms=listing.get("bedrooms")
+        if isinstance(listing.get("bedrooms"), (int, float))
+        else None,
+        layout=layout if isinstance(layout, str) and layout.strip() else None,
+        total=total,
+        breakdown=breakdown,
+        dealbreakers_triggered=triggered,
+        warnings=warnings,
+    )
+
+
+def run_batch(raw_listings: list[Any], card: Scorecard) -> tuple[list[BatchRow], int]:
+    """Score a search-export array: dedupe, score, sort by total desc.
+
+    Returns the sorted rows plus the number of duplicates dropped.
+    """
+    seen: set[tuple[str, Any]] = set()
+    rows: list[BatchRow] = []
+    dupes = 0
+    for raw in raw_listings:
+        if not isinstance(raw, dict):
+            logger.warning("skipping non-object batch entry: %r", raw)
+            continue
+        listing = normalize_search_listing(raw)
+        key = _dedupe_key(listing, raw)
+        if key in seen:
+            dupes += 1
+            continue
+        seen.add(key)
+        rows.append(score_search_listing(raw, card))
+    rows.sort(key=lambda r: r.total, reverse=True)
+    if dupes:
+        logger.info("deduped %d duplicate listing(s)", dupes)
+    return rows, dupes
+
+
+def format_batch_table(rows: list[BatchRow], dupes: int) -> str:
+    """Aligned plain-text table of batch results."""
+    header = f"{'SCORE':>5}  {'ADDRESS':<40} {'PRICE':>7} {'BD':>2}  {'LAYOUT':<18} FLAGS"
+    lines = [header, "-" * len(header)]
+    for row in rows:
+        flags: list[str] = []
+        if row.dealbreakers_triggered:
+            flags.append("!" + ",".join(row.dealbreakers_triggered))
+        if row.warnings:
+            flags.append("~partial")
+        price = f"${int(row.price):,}" if isinstance(row.price, (int, float)) else "-"
+        bedrooms = str(int(row.bedrooms)) if isinstance(row.bedrooms, (int, float)) else "-"
+        layout = (row.layout or "-")[:18]
+        address = row.address[:40]
+        flag_str = " ".join(flags)
+        lines.append(
+            f"{row.total:>5}  {address:<40} {price:>7} {bedrooms:>2}  {layout:<18} {flag_str}"
+        )
+    lines.append("")
+    lines.append(f"{len(rows)} scored · {dupes} deduped")
+    return "\n".join(lines)
+
+
+def batch_rows_to_dicts(rows: list[BatchRow]) -> list[dict[str, Any]]:
+    """JSON-serializable view of batch rows (for --json output)."""
+    return [
+        {
+            "address": row.address,
+            "url": row.url,
+            "price": row.price,
+            "bedrooms": row.bedrooms,
+            "layout": row.layout,
+            "total": row.total,
+            "dealbreakers_triggered": row.dealbreakers_triggered,
+            "warnings": row.warnings,
+            "breakdown": {
+                name: {"points": cs.points, "reasons": cs.reasons}
+                for name, cs in row.breakdown.items()
+            },
+        }
+        for row in rows
+    ]
+
+
+# --------------------------------------------------------------------------- #
 # StreetEasy HTML parser (reserved — not yet implemented)
 # --------------------------------------------------------------------------- #
 def parse_streeteasy_html(html: str) -> Listing:
@@ -623,10 +885,46 @@ def parse_streeteasy_html(html: str) -> Listing:
 # --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
+def _run_single(payload: Any, card: Scorecard, explain: bool) -> int:
+    """Single-listing path: print the score (or --explain breakdown)."""
+    try:
+        result = score_listing(payload, card)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if explain:
+        print(json.dumps(result_to_dict(result), indent=2))
+    else:
+        print(result.total)
+    return 0
+
+
+def _run_batch(payload: list[Any], card: Scorecard, args: argparse.Namespace) -> int:
+    """Batch path: dedupe, score, rank; print a table (or --explain JSON array)."""
+    rows, dupes = run_batch(payload, card)
+    for row in rows:
+        for warning in row.warnings:
+            logger.warning("%s: %s", row.address or "(no address)", warning)
+    if args.json_out is not None:
+        args.json_out.write_text(
+            json.dumps(batch_rows_to_dicts(rows), indent=2) + "\n", encoding="utf-8"
+        )
+        logger.info("wrote %d scored listing(s) -> %s", len(rows), args.json_out)
+    if args.explain:
+        print(json.dumps(batch_rows_to_dicts(rows), indent=2))
+    else:
+        print(format_batch_table(rows, dupes))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
-    """Argparse entry point. Prints the score (or --explain JSON) to stdout."""
+    """Argparse entry point. Single listing prints its score; a JSON array runs batch."""
     parser = argparse.ArgumentParser(
-        description="Score an apartment listing JSON 0-100 against the scorecard YAML."
+        description=(
+            "Score an apartment listing JSON 0-100 against the scorecard YAML. "
+            "If the JSON root is an array (e.g. a StreetEasy search-result export), "
+            "batch mode scores every listing and prints a ranked table."
+        )
     )
     parser.add_argument("listing", type=Path, help="Path to the listing JSON file.")
     parser.add_argument(
@@ -638,35 +936,42 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--explain",
         action="store_true",
-        help="Print a JSON breakdown (per-category points + reasons) instead of just the score.",
+        help="Print a JSON breakdown (per-category points + reasons) instead of "
+        "the score / ranked table.",
+    )
+    parser.add_argument(
+        "--json",
+        dest="json_out",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="Batch mode only: also write full per-listing breakdowns to PATH.",
     )
     parser.add_argument("--verbose", "-v", action="store_true", help="Debug logging.")
     args = parser.parse_args(argv)
 
     logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        level=logging.DEBUG if args.verbose else logging.WARNING,
+        format="%(levelname)s %(name)s: %(message)s",
     )
 
     try:
         card = load_scorecard(args.config)
-        listing = json.loads(args.listing.read_text(encoding="utf-8"))
-        result = score_listing(listing, card)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    try:
+        payload = json.loads(args.listing.read_text(encoding="utf-8"))
     except OSError as exc:
         print(f"error: cannot read {args.listing}: {exc}", file=sys.stderr)
         return 2
     except json.JSONDecodeError as exc:
         print(f"error: {args.listing} is not valid JSON: {exc}", file=sys.stderr)
         return 2
-    except ValueError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
 
-    if args.explain:
-        print(json.dumps(result_to_dict(result), indent=2))
-    else:
-        print(result.total)
-    return 0
+    if isinstance(payload, list):
+        return _run_batch(payload, card, args)
+    return _run_single(payload, card, args.explain)
 
 
 if __name__ == "__main__":

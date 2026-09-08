@@ -39,6 +39,7 @@ location:
   neighborhoods:
     # 25–30 band
     chelsea: 28
+    west chelsea: 26
     flatiron: 27
     flatiron district: 27
     gramercy: 27

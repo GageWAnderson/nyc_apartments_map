@@ -613,3 +613,248 @@ def test_packages_safe_explicit_null_falls_back_to_doorman(card: Any) -> None:
 def test_parser_stub_raises_not_implemented() -> None:
     with pytest.raises(NotImplementedError):
         score_mod.parse_streeteasy_html("<html></html>")
+
+
+# --------------------------------------------------------------------------- #
+# Batch mode (StreetEasy search-result exports)
+# --------------------------------------------------------------------------- #
+_SEARCH_FILE = (
+    Path(__file__).resolve().parents[1]
+    / "data"
+    / "listings"
+    / "chelsea-DPMjSjjxVAsilXG9J"
+    / "listings.json"
+)
+
+
+def search_entry(**overrides: Any) -> dict[str, Any]:
+    entry: dict[str, Any] = {
+        "address": "100 West 26th Street #18A",
+        "price": 6295,
+        "bedrooms": 1,
+        "bathrooms": 1,
+        "squareFeet": 670,
+        "propertyType": "Rental unit",
+        "neighborhood": "Chelsea",
+        "listingType": "rental",
+        "description": "",
+        "amenities": [],
+        "latitude": 0,
+        "longitude": 0,
+        "daysOnStreetEasy": 0,
+        "yearBuilt": 0,
+        "url": "https://streeteasy.com/building/chelsea-tower/18a",
+    }
+    entry.update(overrides)
+    return entry
+
+
+# --- normalize_search_listing --------------------------------------------- #
+def test_normalize_maps_export_fields() -> None:
+    listing = score_mod.normalize_search_listing(search_entry())
+    assert listing["name"] == "100 West 26th Street #18A"
+    assert listing["unit"] == "18A"
+    assert listing["price"] == 6295
+    assert listing["bedrooms"] == 1
+    assert listing["sqft"] == 670
+    assert listing["rooms"] == 1
+    assert listing["neighborhood"] == "Chelsea"
+    assert listing["building_type"] == "Rental unit"
+    assert listing["source_url"] == "https://streeteasy.com/building/chelsea-tower/18a"
+
+
+def test_normalize_omits_zero_and_empty_values() -> None:
+    entry = search_entry(squareFeet=0, price=0, amenities=[], yearBuilt=0, description="")
+    listing = score_mod.normalize_search_listing(entry)
+    assert "sqft" not in listing
+    assert "price" not in listing
+    assert "amenities" not in listing
+    assert "building_year_built" not in listing
+
+
+def test_normalize_zero_bedrooms_gives_no_rooms() -> None:
+    listing = score_mod.normalize_search_listing(search_entry(bedrooms=0))
+    assert "rooms" not in listing
+
+
+@pytest.mark.parametrize(
+    ("address", "street", "unit"),
+    [
+        ("311 11th Avenue #PH308", "311 11th Avenue", "PH308"),
+        ("243 West 28th Street #S20M", "243 West 28th Street", "S20M"),
+        ("100 West 26th Street #18A", "100 West 26th Street", "18A"),
+        ("500 West 18th Street WEST-TOWER-11B", "500 West 18th Street", "WEST-TOWER-11B"),
+        ("311 West 19th Street #1", "311 West 19th Street", "1"),
+        ("147 West 22nd Street", "147 West 22nd Street", None),
+    ],
+)
+def test_split_address_unit(address: str, street: str, unit: str | None) -> None:
+    assert score_mod._split_address_unit(address) == (street, unit)
+
+
+def test_unit_floor_feeds_from_batch_address(card: Any) -> None:
+    listing = score_mod.normalize_search_listing(search_entry(address="243 West 28th Street #S20M"))
+    enriched = score_mod.enrich_listing(listing, card)
+    assert enriched["unit_floor"] == 20
+
+
+# --- null-safe scoring ----------------------------------------------------- #
+def test_score_search_listing_missing_layout_and_situation(card: Any) -> None:
+    row = score_mod.score_search_listing(search_entry(), card)
+    assert row.breakdown["unit_function"].points == 0
+    assert row.breakdown["control"].points == 0
+    assert len(row.warnings) == 2
+    # deterministic categories still score
+    assert row.breakdown["location"].points == 28
+    assert row.total == sum(cs.points for cs in row.breakdown.values())
+
+
+def test_score_search_listing_with_overrides_scores_fully(card: Any) -> None:
+    entry = search_entry()
+    entry["layout"] = "true_1br"
+    entry["living_situation"] = "solo"
+    entry["amenities"] = ["ELEVATOR", "LAUNDRY", "DOORMAN"]
+    row = score_mod.score_search_listing(entry, card)
+    assert row.warnings == []
+    assert row.breakdown["unit_function"].points == 28
+    assert row.breakdown["control"].points == 15
+
+
+def test_score_search_listing_unknown_layout_warns(card: Any) -> None:
+    entry = search_entry()
+    entry["layout"] = "penthouse"
+    row = score_mod.score_search_listing(entry, card)
+    assert row.breakdown["unit_function"].points == 0
+    assert any("unknown layout" in w for w in row.warnings)
+
+
+# --- dedupe ---------------------------------------------------------------- #
+def test_run_batch_dedupes_featured_infeed_urls(card: Any) -> None:
+    base = search_entry()
+    entries = [
+        base,
+        search_entry(url="https://streeteasy.com/building/chelsea-tower/18a?featured=1"),
+        search_entry(url="https://streeteasy.com/building/chelsea-tower/18a?infeed=1"),
+    ]
+    rows, dupes = score_mod.run_batch(entries, card)
+    assert len(rows) == 1
+    assert dupes == 2
+
+
+def test_run_batch_different_price_not_deduped(card: Any) -> None:
+    rows, dupes = score_mod.run_batch([search_entry(), search_entry(price=6495)], card)
+    assert len(rows) == 2
+    assert dupes == 0
+
+
+def test_run_batch_skips_non_objects(card: Any) -> None:
+    rows, _ = score_mod.run_batch([search_entry(), "oops", 42], card)
+    assert len(rows) == 1
+
+
+def test_run_batch_sorted_desc(card: Any) -> None:
+    entries = [
+        search_entry(address="1 Low St #1", neighborhood="Long Island City"),
+        search_entry(address="1 High St #2", neighborhood="Chelsea"),
+    ]
+    rows, _ = score_mod.run_batch(entries, card)
+    assert rows[0].total >= rows[1].total
+    assert rows[0].address == "1 High St #2"
+
+
+# --- real export file ------------------------------------------------------- #
+@pytest.mark.skipif(not _SEARCH_FILE.exists(), reason="search export not present")
+def test_batch_on_real_export_file(card: Any) -> None:
+    raw = json.loads(_SEARCH_FILE.read_text())
+    rows, dupes = score_mod.run_batch(raw, card)
+    assert len(raw) == 50
+    assert len(rows) + dupes == 50
+    assert dupes > 0
+    # every row scored; sorted desc
+    assert all(isinstance(r.total, int) for r in rows)
+    assert [r.total for r in rows] == sorted((r.total for r in rows), reverse=True)
+    # known listing appears exactly once
+    tower = [r for r in rows if "100 West 26th Street #18A" in r.address]
+    assert len(tower) == 1
+    # West Chelsea now resolves (not the default)
+    west = [r for r in rows if "West Chelsea" in str(r.breakdown["location"].reasons)]
+    assert all(r.breakdown["location"].points == 26 for r in west)
+    # Chelsea proper rows outrank West Chelsea rows
+    assert rows[0].breakdown["location"].points == 28
+
+
+# --- batch CLI -------------------------------------------------------------- #
+def test_cli_batch_table(tmp_path: Path, capsys: Any) -> None:
+    f = tmp_path / "listings.json"
+    f.write_text(json.dumps([search_entry(), search_entry(address="1 Other St #3")]))
+    rc = score_mod.main([str(f)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "SCORE" in out and "ADDRESS" in out
+    assert "2 scored" in out
+    assert "100 West 26th Street #18A" in out
+
+
+def test_cli_batch_json_out(tmp_path: Path, capsys: Any) -> None:
+    src = tmp_path / "listings.json"
+    src.write_text(json.dumps([search_entry()]))
+    out_json = tmp_path / "out.json"
+    rc = score_mod.main([str(src), "--json", str(out_json)])
+    assert rc == 0
+    rows = json.loads(out_json.read_text())
+    assert len(rows) == 1
+    assert rows[0]["address"] == "100 West 26th Street #18A"
+    assert rows[0]["warnings"]
+    assert "breakdown" in rows[0]
+    capsys.readouterr()
+
+
+def test_cli_batch_explain_prints_array(tmp_path: Path, capsys: Any) -> None:
+    src = tmp_path / "listings.json"
+    src.write_text(json.dumps([search_entry()]))
+    rc = score_mod.main([str(src), "--explain"])
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert isinstance(payload, list)
+    assert payload[0]["total"] >= 0
+
+
+def test_cli_single_dict_still_single_mode(tmp_path: Path, capsys: Any) -> None:
+    f = tmp_path / "listing.json"
+    f.write_text(json.dumps(base_listing()))
+    rc = score_mod.main([str(f)])
+    out = capsys.readouterr().out.strip()
+    assert rc == 0
+    assert out == "94"
+
+
+@pytest.mark.parametrize(
+    ("unit", "expected"),
+    [
+        ("S20M", 20),
+        ("N10A", 10),
+        ("22A12", 22),
+        ("WEST-TOWER-11B", None),  # multi-word designator: too ambiguous
+        ("PH308", 308),
+        ("GARDEN", None),
+    ],
+)
+def test_floor_from_unit_letter_prefixed(unit: str, expected: int | None) -> None:
+    assert score_mod.floor_from_unit(unit, None) == expected
+
+
+def test_normalize_passes_through_scorer_native_fields() -> None:
+    entry = search_entry()
+    entry["layout"] = "true_1br"
+    entry["living_situation"] = "solo"
+    entry["bed_in_sightline"] = False
+    listing = score_mod.normalize_search_listing(entry)
+    assert listing["layout"] == "true_1br"
+    assert listing["living_situation"] == "solo"
+    assert listing["bed_in_sightline"] is False
+
+
+def test_normalize_passthrough_skips_export_noise() -> None:
+    listing = score_mod.normalize_search_listing(search_entry())
+    for noise in ("maintenanceFee", "taxes", "pricePerSqFt", "agentBrokerage", "description"):
+        assert noise not in listing

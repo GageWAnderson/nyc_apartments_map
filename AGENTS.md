@@ -46,7 +46,15 @@ message on commit. To run the full suite manually:
   is a documented stub (PerimeterX blocks plain fetches; pages must be
   browser-saved). Tests: `tests/test_apartment_scorer.py` (logic-only;
   imports `apartment_scorer.score` via the editable install's `src/` path);
-  smoke fixture at `tests/data/test_listing.json`.
+  smoke fixture at `tests/data/test_listing.json`. When the input JSON root
+  is an **array**, the same CLI runs **batch mode** for StreetEasy
+  search-result exports (Apify shape: `address`/`price`/`bedrooms`/
+  `squareFeet`/`neighborhood`/`url`): `normalize_search_listing()` maps the
+  export (zero/empty = unknown → omitted; scorer-native fields pass through),
+  dedupes on address+price (featured/infeed URLs collapse), scores
+  **null-safely** (missing `layout`/`living_situation` → that category 0 +
+  warning, row still ranks), and prints a ranked table (`--json PATH` dumps
+  full breakdowns). Sample export under `data/listings/`.
 
 ## Quality checks
 

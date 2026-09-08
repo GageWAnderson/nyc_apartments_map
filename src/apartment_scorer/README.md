@@ -14,16 +14,84 @@ Trophy amenities and luxury premiums score ~nothing.
 ## Usage
 
 ```bash
-uv run python src/apartment_scorer/score.py listing.json            # prints e.g. 91
-uv run python src/apartment_scorer/score.py listing.json --explain  # full JSON breakdown
+# Single listing (JSON object) -> prints the score
+uv run python src/apartment_scorer/score.py listing.json
+uv run python src/apartment_scorer/score.py listing.json --explain   # full JSON breakdown
 uv run python src/apartment_scorer/score.py listing.json --config my_scorecard.yaml
+
+# Batch (JSON array, e.g. a StreetEasy search-result export) -> ranked table
+uv run python src/apartment_scorer/score.py data/listings/chelsea-XXX/listings.json
+uv run python src/apartment_scorer/score.py listings.json --json out/scores.json
 ```
 
-Exit codes: `0` = scored (score on stdout), `2` = unreadable/invalid JSON,
-unknown `layout`/`living_situation`, or malformed config.
+Exit codes: `0` = scored, `2` = unreadable/invalid JSON or malformed config.
+In single mode, an unknown `layout`/`living_situation` is also exit 2; in
+batch mode those score 0 with a warning instead (see below).
 
-A worked example lives at [`tests/data/test_listing.json`](../../tests/data/test_listing.json)
+A worked single-listing example lives at
+[`tests/data/test_listing.json`](../../tests/data/test_listing.json)
 (Chelsea Tower #18A, from a real StreetEasy listing).
+
+## Batch mode
+
+When the input JSON root is an **array**, the scorer switches to batch mode.
+This is designed for StreetEasy **search-result exports** (e.g. from the
+Apify StreetEasy scraper) — one object per listing with keys like `address`,
+`price`, `bedrooms`, `squareFeet`, `propertyType`, `neighborhood`, `url`.
+
+```bash
+uv run python src/apartment_scorer/score.py data/listings/chelsea-DPMjSjjxVAsilXG9J/listings.json
+```
+
+```
+SCORE  ADDRESS                                    PRICE BD  LAYOUT             FLAGS
+------------------------------------------------------------------------------------
+   34  311 West 19th Street #1                   $8,250  3  -                  ~partial
+   28  100 West 26th Street #18A                 $6,295  1  -                  ~partial
+   ...
+42 scored · 8 deduped
+```
+
+### How the export maps onto the schema
+
+`normalize_search_listing()` translates each export entry:
+
+| Export key | Schema field | Notes |
+|---|---|---|
+| `address` | `name` + `unit` | unit split off (`#PH308`→`PH308`); floor parsed (`S20M`→20, `WEST-TOWER-11B`→None) |
+| `price` | `price` | |
+| `bedrooms` | `bedrooms` (+`rooms`) | `0` bedrooms → `rooms` omitted |
+| `squareFeet` | `sqft` | `0` (unknown) → omitted |
+| `propertyType` | `building_type` | |
+| `neighborhood` | `neighborhood` | `"West Chelsea"` scores 26 |
+| `yearBuilt` | `building_year_built` | `0` → omitted |
+| `url` | `source_url` | query params ignored |
+| `amenities` | `amenities` | `[]` → omitted |
+
+Zero/empty export values mean "unknown" and are **omitted**, so derived
+flags stay false and no dealbreaker fires on absent facts. Any
+**scorer-native field already present** on an entry (e.g. a hand-completed
+`layout`, `living_situation`, `bed_in_sightline`, or a richer scraper's
+`amenities`) passes straight through, so you can enrich individual rows.
+
+### Null-safe scoring (why every export row gets a score)
+
+Search exports never carry `layout` or `living_situation`. Rather than drop
+those rows, batch mode scores them **null-safely**: the missing category
+(`unit_function` and/or `control`) scores **0 with a warning**, and the row
+still ranks on its deterministic categories (location, access, hygiene).
+Rows with warnings are flagged `~partial` in the table; rows with
+dealbreakers get `!name`. To fully score a row, add `layout` /
+`living_situation` (and ideally `amenities`) to its export entry — they pass
+through.
+
+### Dedupe & ranking
+
+Duplicates (the same unit re-exported with `?featured=1` / `?infeed=1`
+URLs) are collapsed on **address + price**; the footer reports
+`N scored · M deduped`. Rows sort by score descending. `--json PATH` writes
+the full per-listing breakdowns (including `warnings`) to a file;
+`--explain` prints the same array to stdout.
 
 ## Input schema
 
