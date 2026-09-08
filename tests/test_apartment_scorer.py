@@ -41,6 +41,57 @@ def base_listing(**overrides: Any) -> dict[str, Any]:
     return listing
 
 
+def se_listing(**overrides: Any) -> dict[str, Any]:
+    """Deterministic StreetEasy-shaped listing (Chelsea Tower #18A smoke data)."""
+    listing: dict[str, Any] = {
+        "neighborhood": "Chelsea",
+        "layout": "true_1br",
+        "living_situation": "solo",
+        "price": 6295,
+        "sqft": 670,
+        "bedrooms": 1,
+        "rooms": 2,
+        "unit": "#18A",
+        "amenities": [
+            "BIKE_ROOM",
+            "CONCIERGE",
+            "ELEVATOR",
+            "FIOS_AVAILABLE",
+            "DOORMAN",
+            "PARKING",
+            "SHARED_OUTDOOR_SPACE",
+            "GYM",
+            "LAUNDRY",
+            "LIVE_IN_SUPER",
+            "STORAGE_SPACE",
+            "WHEELCHAIR_ACCESS",
+            "GARDEN",
+            "PATIO",
+            "ROOF_DECK",
+        ],
+        "building_floor_count": 33,
+        "building_year_built": 2003,
+        "transit_stations": [
+            {"name": "23rd St", "routes": ["F", "M"], "distance": 0.1347},
+            {"name": "23rd Street Station", "routes": ["PATH"], "distance": 0.1423},
+            {"name": "28th St", "routes": ["R", "W"], "distance": 0.1563},
+            {"name": "28th St", "routes": ["1"], "distance": 0.1657},
+            {"name": "23rd St", "routes": ["1"], "distance": 0.1884},
+        ],
+        "building_type": "Rental building",
+        "floor_plan_count": 1,
+        "bed_in_sightline": False,
+        "seats_four_without_bed": True,
+        "walk_to_work_anchor": True,
+        "amenity_trap": False,
+        "quiet_enough_to_sleep": False,
+        "bookable_roof": None,
+        "usable_balcony": False,
+    }
+    listing.update(overrides)
+    return listing
+
+
 # --------------------------------------------------------------------------- #
 # Scorecard loading / validation
 # --------------------------------------------------------------------------- #
@@ -269,15 +320,23 @@ def test_bed_in_sightline_1br_does_not_trigger_studio_rule(card: Any) -> None:
 
 
 def test_lic_luxury_tower_triggers(card: Any) -> None:
-    listing = base_listing(neighborhood="LIC", building_type="luxury_tower")
+    listing = se_listing(neighborhood="LIC")
     result = score_mod.score_listing(listing, card)
     assert "lic_or_downtown_brooklyn_tower_plan" in result.dealbreakers_triggered
 
 
 def test_lic_non_tower_does_not_trigger_tower_rule(card: Any) -> None:
-    listing = base_listing(neighborhood="LIC", building_type="walkup")
+    listing = se_listing(
+        neighborhood="LIC", building_floor_count=5, building_year_built=1925, amenities=[]
+    )
     result = score_mod.score_listing(listing, card)
     assert "lic_or_downtown_brooklyn_tower_plan" not in result.dealbreakers_triggered
+
+
+def test_building_type_manual_override_still_works(card: Any) -> None:
+    listing = base_listing(neighborhood="LIC", building_type="luxury_tower")
+    result = score_mod.score_listing(listing, card)
+    assert "lic_or_downtown_brooklyn_tower_plan" in result.dealbreakers_triggered
 
 
 def test_midtown_east_identity_move_triggers(card: Any) -> None:
@@ -294,13 +353,38 @@ def test_amenity_premium_threshold(card: Any) -> None:
 
 def test_five_flight_walkup_requires_hosting_intent(card: Any) -> None:
     hosting = score_mod.score_listing(
-        base_listing(floor_level="walkup_high", intends_to_host=True), card
+        se_listing(
+            unit="#5A",
+            amenities=["LAUNDRY"],
+            building_floor_count=6,
+            building_year_built=1910,
+            intends_to_host=True,
+        ),
+        card,
     )
     quiet = score_mod.score_listing(
-        base_listing(floor_level="walkup_high", intends_to_host=False), card
+        se_listing(
+            unit="#5A",
+            amenities=["LAUNDRY"],
+            building_floor_count=6,
+            building_year_built=1910,
+            intends_to_host=False,
+        ),
+        card,
     )
     assert "five_flight_walkup_hosting" in hosting.dealbreakers_triggered
     assert "five_flight_walkup_hosting" not in quiet.dealbreakers_triggered
+
+
+def test_five_flight_rule_needs_no_elevator(card: Any) -> None:
+    listing = se_listing(
+        unit="#12C",
+        building_floor_count=20,
+        building_year_built=1965,
+        intends_to_host=True,
+    )
+    result = score_mod.score_listing(listing, card)
+    assert "five_flight_walkup_hosting" not in result.dealbreakers_triggered
 
 
 def test_clean_listing_triggers_nothing(card: Any) -> None:
@@ -390,3 +474,142 @@ def test_cli_unknown_layout_exits_2(tmp_path: Path, capsys: Any) -> None:
     rc = score_mod.main([str(listing_file)])
     assert rc == 2
     assert "unknown layout" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------- #
+# Deterministic derivations (StreetEasy-shaped inputs)
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize(
+    ("unit", "expected"),
+    [
+        ("#18A", 18),
+        ("18A", 18),
+        ("3R", 3),
+        ("#07H", 7),
+        ("PH2", 2),
+        ("GARDEN", None),
+        ("", None),
+    ],
+)
+def test_floor_from_unit(unit: str, expected: int | None) -> None:
+    assert score_mod.floor_from_unit(unit, None) == expected
+
+
+def test_floor_from_unit_ph_falls_back_to_building_floors() -> None:
+    assert score_mod.floor_from_unit("PH", 30) == 30
+    assert score_mod.floor_from_unit("PH", None) is None
+
+
+def test_derive_amenity_flags_from_enum(card: Any) -> None:
+    flags = score_mod.derive_amenity_flags(
+        {"amenities": ["ELEVATOR", "LAUNDRY", "DOORMAN", "GYM", "ROOF_DECK"]}, card
+    )
+    assert flags == {
+        "laundry_in_building": True,
+        "has_elevator": True,
+        "has_doorman": True,
+        "has_gym": True,
+        "has_roof_deck": True,
+        "has_shared_outdoor": False,
+    }
+
+
+def test_derive_amenity_flags_accepts_json_ld_snake_case(card: Any) -> None:
+    flags = score_mod.derive_amenity_flags({"amenities": ["laundry", "elevator"]}, card)
+    assert flags["laundry_in_building"] is True
+    assert flags["has_elevator"] is True
+
+
+def test_explicit_boolean_overrides_derived_flag(card: Any) -> None:
+    flags = score_mod.derive_amenity_flags(
+        {"amenities": ["LAUNDRY"], "laundry_in_building": False}, card
+    )
+    assert flags["laundry_in_building"] is False
+
+
+def test_derive_amenity_flags_no_amenities(card: Any) -> None:
+    flags = score_mod.derive_amenity_flags({}, card)
+    assert all(v is False for v in flags.values())
+
+
+def test_distinct_transit_routes() -> None:
+    listing = se_listing()
+    assert score_mod.distinct_transit_routes(listing) == 6  # F, M, PATH, R, W, 1
+
+
+def test_distinct_transit_routes_empty() -> None:
+    assert score_mod.distinct_transit_routes({}) == 0
+    assert score_mod.distinct_transit_routes({"transit_stations": "oops"}) == 0
+
+
+def test_effective_building_class_luxury_tower(card: Any) -> None:
+    listing = se_listing()
+    flags = score_mod.derive_amenity_flags(listing, card)
+    assert score_mod.effective_building_class(listing, card, flags) == "luxury_tower"
+
+
+def test_effective_building_class_elevator_building(card: Any) -> None:
+    listing = se_listing(building_floor_count=12, building_year_built=1965, amenities=["ELEVATOR"])
+    flags = score_mod.derive_amenity_flags(listing, card)
+    assert score_mod.effective_building_class(listing, card, flags) == "elevator_building"
+
+
+def test_effective_building_class_walkup(card: Any) -> None:
+    listing = se_listing(building_floor_count=5, building_year_built=1920, amenities=[])
+    flags = score_mod.derive_amenity_flags(listing, card)
+    assert score_mod.effective_building_class(listing, card, flags) == "walkup"
+
+
+def test_effective_building_class_unknown(card: Any) -> None:
+    listing = se_listing(building_floor_count=None, building_year_built=None, amenities=[])
+    del listing["building_floor_count"], listing["building_year_built"]
+    flags = score_mod.derive_amenity_flags(listing, card)
+    assert score_mod.effective_building_class(listing, card, flags) == "unknown"
+
+
+def test_effective_building_class_manual_override(card: Any) -> None:
+    listing = se_listing(building_type="walkup")
+    flags = score_mod.derive_amenity_flags(listing, card)
+    assert score_mod.effective_building_class(listing, card, flags) == "walkup"
+
+
+def test_enrich_listing_fills_derived_fields(card: Any) -> None:
+    enriched = score_mod.enrich_listing(se_listing(), card)
+    assert enriched["unit_floor"] == 18
+    assert enriched["distinct_transit_routes"] == 6
+    assert enriched["effective_building_class"] == "luxury_tower"
+    assert enriched["has_elevator"] is True
+    assert enriched["laundry_in_building"] is True
+
+
+def test_enrich_listing_never_overwrites_explicit(card: Any) -> None:
+    enriched = score_mod.enrich_listing(se_listing(unit_floor=2, distinct_transit_routes=1), card)
+    assert enriched["unit_floor"] == 2
+    assert enriched["distinct_transit_routes"] == 1
+
+
+# --------------------------------------------------------------------------- #
+# StreetEasy-shaped end-to-end
+# --------------------------------------------------------------------------- #
+def test_se_listing_scores_from_derived_fields_only(card: Any) -> None:
+    """Chelsea Tower #18A with no manual access/hygiene booleans at all."""
+    result = score_mod.score_listing(se_listing(), card)
+    assert result.dealbreakers_triggered == []
+    assert result.breakdown["access"].points == 15
+    assert result.breakdown["hygiene_outdoor"].points == 5  # doorman + roof deck
+    assert result.total == 28 + 28 + 15 + 15 + 5  # 91
+
+
+def test_se_listing_access_works_without_floor_level(card: Any) -> None:
+    result = score_mod.score_listing(se_listing(amenities=["LAUNDRY"], unit="#2A"), card)
+    assert result.breakdown["access"].points == 6 + 5 + 4  # low floor + routes + laundry
+
+
+def test_packages_safe_explicit_null_falls_back_to_doorman(card: Any) -> None:
+    result = score_mod.score_listing(se_listing(packages_safe=None), card)
+    assert result.breakdown["hygiene_outdoor"].points == 5
+
+
+def test_parser_stub_raises_not_implemented() -> None:
+    with pytest.raises(NotImplementedError):
+        score_mod.parse_streeteasy_html("<html></html>")

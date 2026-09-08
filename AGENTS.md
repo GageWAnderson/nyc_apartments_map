@@ -35,11 +35,18 @@ message on commit. To run the full suite manually:
 - `src/apartment_scorer/` is a standalone PoC (argparse CLI, no pipeline
   dependency) that scores a single listing JSON 0–100 against
   `configs/apartment_scorecard.yaml`. All rubric numbers (category budgets,
-  per-neighborhood/layout scores, dealbreaker rules) live in that YAML —
-  retune there, not in `score.py`. Lookup strings are slug-normalized on
-  both sides (`"Hell's Kitchen"` == `hells_kitchen`), so YAML keys must stay
-  in slug form. Tests: `tests/test_apartment_scorer.py` (logic-only; imports
-  `apartment_scorer.score` via the editable install's `src/` path).
+  per-neighborhood/layout scores, amenity-enum→flag map, building-class
+  heuristic, dealbreaker rules) live in that YAML — retune there, not in
+  `score.py`. Lookup strings are slug-normalized on both sides
+  (`"Hell's Kitchen"` == `hells_kitchen`), so YAML keys must stay in slug
+  form. The schema mirrors StreetEasy's deterministic payload
+  (`amenities` SCREAMING_SNAKE_CASE enum, `unit` → parsed floor,
+  `transit_stations` → distinct routes); `enrich_listing()` derives flags
+  before scoring and explicit fields always win. `parse_streeteasy_html()`
+  is a documented stub (PerimeterX blocks plain fetches; pages must be
+  browser-saved). Tests: `tests/test_apartment_scorer.py` (logic-only;
+  imports `apartment_scorer.score` via the editable install's `src/` path);
+  smoke fixture at `tests/data/test_listing.json`.
 
 ## Quality checks
 

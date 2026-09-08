@@ -115,7 +115,42 @@ control:
     new_roommates: 0
 
 # --------------------------------------------------------------------------- #
+# StreetEasy amenity enum -> scorer flags. Values are the exact
+# SCREAMING_SNAKE_CASE strings from the listing payload's
+# propertyDetails.amenities.list (JSON-LD amenityFeature uses the same names
+# in snake_case; the scorer normalizes both sides, so either casing works).
+# A flag is true when ANY listed amenity is present in the listing's
+# `amenities` array. Explicit boolean fields on the listing (e.g.
+# laundry_in_building: true) override the derived flag.
+# --------------------------------------------------------------------------- #
+amenity_flags:
+  laundry_in_building: [LAUNDRY]
+  has_elevator: [ELEVATOR]
+  has_doorman: [DOORMAN, CONCIERGE]
+  has_gym: [GYM]
+  has_roof_deck: [ROOF_DECK]
+  has_shared_outdoor: [GARDEN, PATIO, SHARED_OUTDOOR_SPACE]
+
+# Heuristic for `effective_building_class` (drives the LIC/DTBK tower
+# dealbreaker). `luxury_tower` requires: building floor count >= min_floors,
+# year built >= min_year, and ALL of the required amenity flags present.
+# Buildings with an elevator that fail the tower test are `elevator_building`;
+# no elevator + known floor count is `walkup`; otherwise `unknown`.
+building_class:
+  luxury_tower:
+    min_floors: 20
+    min_year: 1990
+    require_flags: [has_doorman, has_gym]
+
+# Minimum distinct transit routes (union of `transit_stations[].routes`)
+# that counts as "multiple lines" for access points.
+transit_min_distinct_routes: 2
+
+# --------------------------------------------------------------------------- #
 # Access (max 15) — additive points, clamped to the category max.
+# elevator_or_low_walkup: has_elevator flag, or a parsed unit floor <= 3.
+# multi_line_or_walk_anchor: distinct transit routes >= the minimum above,
+# or the manual walk_to_work_anchor flag.
 # --------------------------------------------------------------------------- #
 access:
   points:
@@ -127,6 +162,9 @@ access:
 # Hygiene / outdoor (max 10) — additive points, clamped to the category max.
 # amenity_trap (trophy finishes, sliver balcony, unbookable roof, gym you'll
 # ignore) caps the whole category at amenity_trap_cap.
+# packages_safe is derived from the has_doorman flag (override with an
+# explicit packages_safe boolean). usable_balcony_or_bookable_roof is manual
+# (usable_balcony / bookable_roof) or derived from the has_roof_deck flag.
 # --------------------------------------------------------------------------- #
 hygiene_outdoor:
   amenity_trap_cap: 5
@@ -154,7 +192,7 @@ dealbreakers:
   - name: lic_or_downtown_brooklyn_tower_plan
     when:
       neighborhood: [long island city, lic, downtown brooklyn]
-      building_type: luxury_tower
+      effective_building_class: luxury_tower
   - name: midtown_east_identity_move
     when:
       neighborhood: [midtown east, murray hill, turtle bay, sutton place]
@@ -162,6 +200,9 @@ dealbreakers:
     when:
       amenity_premium_over_comps: {min: 1000}
   - name: five_flight_walkup_hosting
+    # unit_floor is parsed from the `unit` string (e.g. "#18A" -> 18);
+    # an explicit `unit_floor` number on the listing wins.
     when:
-      floor_level: walkup_high
+      unit_floor: {min: 5}
+      has_elevator: false
       intends_to_host: true

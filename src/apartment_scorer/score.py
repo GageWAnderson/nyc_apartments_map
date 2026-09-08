@@ -61,6 +61,15 @@ class DealbreakerRule:
 
 
 @dataclass(frozen=True)
+class LuxuryTowerRule:
+    """Heuristic thresholds for classifying a building as a luxury tower."""
+
+    min_floors: int
+    min_year: int
+    require_flags: list[str]
+
+
+@dataclass(frozen=True)
 class Scorecard:
     """Parsed + validated contents of the scorecard YAML."""
 
@@ -73,6 +82,9 @@ class Scorecard:
     sightline_cap: int
     hosting_fail_cap: int
     control_scores: dict[str, int]
+    amenity_flags: dict[str, list[str]]
+    luxury_tower: LuxuryTowerRule
+    transit_min_distinct_routes: int
     access_points: dict[str, int]
     hygiene_points: dict[str, int]
     amenity_trap_cap: int
@@ -112,6 +124,132 @@ def _slug_map(mapping: dict[str, int]) -> dict[str, int]:
 
 
 # --------------------------------------------------------------------------- #
+# Deterministic derivations (pure)
+# --------------------------------------------------------------------------- #
+def floor_from_unit(unit: Any, building_floor_count: int | None) -> int | None:
+    """Parse the floor number from a unit designator like '#18A', '3R', 'PH2'.
+
+    Returns None when no digits are present. Penthouse designators map to the
+    building's floor count when it is known.
+    """
+    if not isinstance(unit, str):
+        return None
+    text = unit.strip().lstrip("#").upper()
+    digits = re.match(r"\d+", text)
+    if digits:
+        return int(digits.group())
+    if text.startswith("PH"):
+        ph_digits = re.match(r"PH(\d+)", text)
+        if ph_digits:
+            return int(ph_digits.group(1))
+        return building_floor_count
+    return None
+
+
+def derive_amenity_flags(listing: Listing, card: Scorecard) -> dict[str, bool]:
+    """Booleans derived from the listing's `amenities` enum list via the YAML map.
+
+    An explicit boolean field of the same name on the listing always wins
+    (manual override of the derived value).
+    """
+    raw = listing.get("amenities", [])
+    present = {_slug(a) for a in raw} if isinstance(raw, list) else set()
+    flags: dict[str, bool] = {}
+    for flag, enums in card.amenity_flags.items():
+        derived = any(_slug(e) in present for e in enums)
+        explicit = listing.get(flag)
+        flags[flag] = explicit if isinstance(explicit, bool) else derived
+    return flags
+
+
+def resolve_flag(listing: Listing, name: str, fallback: bool) -> bool:
+    """Explicit boolean wins; explicit null/absent uses the fallback (derived)."""
+    value = listing.get(name)
+    return value if isinstance(value, bool) else fallback
+
+
+def distinct_transit_routes(listing: Listing) -> int:
+    """Count distinct route names across `transit_stations` entries."""
+    stations = listing.get("transit_stations", [])
+    if not isinstance(stations, list):
+        return 0
+    routes: set[str] = set()
+    for station in stations:
+        if isinstance(station, dict):
+            station_routes = station.get("routes", [])
+            if isinstance(station_routes, list):
+                routes.update(str(r).strip().upper() for r in station_routes)
+    return len(routes)
+
+
+_SCORECARD_BUILDING_CLASSES = {
+    "luxury_tower",
+    "elevator_building",
+    "walkup",
+    "low_rise",
+    "townhouse",
+    "unknown",
+}
+
+
+def effective_building_class(listing: Listing, card: Scorecard, flags: dict[str, bool]) -> str:
+    """Classify the building: luxury_tower | elevator_building | walkup | unknown.
+
+    An explicit `effective_building_class` string always wins. A `building_type`
+    string is honored only when it names a scorecard class (e.g. a manual
+    `building_type: luxury_tower`); source labels like StreetEasy's
+    "Rental building" are ignored and fall through to the heuristic.
+    """
+    for field_name in ("effective_building_class", "building_type"):
+        value = listing.get(field_name)
+        if isinstance(value, str) and value.strip():
+            slugged = _slug(value).replace(" ", "_")
+            if field_name == "effective_building_class" or slugged in _SCORECARD_BUILDING_CLASSES:
+                return slugged
+
+    floors = listing.get("building_floor_count")
+    year = listing.get("building_year_built")
+    floors_num = (
+        float(floors) if isinstance(floors, int | float) and not isinstance(floors, bool) else None
+    )
+    year_num = float(year) if isinstance(year, int | float) and not isinstance(year, bool) else None
+    rule = card.luxury_tower
+    if (
+        floors_num is not None
+        and year_num is not None
+        and floors_num >= rule.min_floors
+        and year_num >= rule.min_year
+        and all(flags.get(flag, False) for flag in rule.require_flags)
+    ):
+        return "luxury_tower"
+    if flags.get("has_elevator"):
+        return "elevator_building"
+    if floors_num is not None:
+        return "walkup"
+    return "unknown"
+
+
+def enrich_listing(listing: Listing, card: Scorecard) -> Listing:
+    """Return a copy of the listing with derived fields filled in.
+
+    Derived fields (amenity flags, distinct_transit_routes, unit_floor,
+    effective_building_class) never overwrite explicit values already present.
+    """
+    enriched = dict(listing)
+    enriched.update(derive_amenity_flags(listing, card))
+    if "distinct_transit_routes" not in enriched:
+        enriched["distinct_transit_routes"] = distinct_transit_routes(listing)
+    if "unit_floor" not in enriched:
+        floors = listing.get("building_floor_count")
+        enriched["unit_floor"] = floor_from_unit(
+            listing.get("unit"), floors if isinstance(floors, int) else None
+        )
+    if "effective_building_class" not in enriched:
+        enriched["effective_building_class"] = effective_building_class(listing, card, enriched)
+    return enriched
+
+
+# --------------------------------------------------------------------------- #
 # Scorecard loading / validation
 # --------------------------------------------------------------------------- #
 def load_scorecard(path: Path) -> Scorecard:
@@ -141,6 +279,25 @@ def load_scorecard(path: Path) -> Scorecard:
     access = _as_mapping(need("access"), "access")
     hygiene = _as_mapping(need("hygiene_outdoor"), "hygiene_outdoor")
 
+    amenity_flags: dict[str, list[str]] = {}
+    for flag, enums in _as_mapping(raw.get("amenity_flags", {}), "amenity_flags").items():
+        if not isinstance(enums, list) or not all(isinstance(e, str) for e in enums):
+            raise ValueError(f"amenity_flags.{flag} must be a list of strings")
+        amenity_flags[str(flag)] = [str(e) for e in enums]
+
+    tower_raw = _as_mapping(
+        _as_mapping(raw.get("building_class", {}), "building_class").get("luxury_tower", {}),
+        "building_class.luxury_tower",
+    )
+    require_flags = tower_raw.get("require_flags", [])
+    if not isinstance(require_flags, list) or not all(isinstance(f, str) for f in require_flags):
+        raise ValueError("building_class.luxury_tower.require_flags must be a list of strings")
+    luxury_tower = LuxuryTowerRule(
+        min_floors=int(tower_raw.get("min_floors", 0)),
+        min_year=int(tower_raw.get("min_year", 0)),
+        require_flags=[str(f) for f in require_flags],
+    )
+
     rules: list[DealbreakerRule] = []
     for i, entry in enumerate(_as_list(need("dealbreakers"), "dealbreakers")):
         rule = _as_mapping(entry, f"dealbreakers[{i}]")
@@ -164,6 +321,9 @@ def load_scorecard(path: Path) -> Scorecard:
         sightline_cap=int(unit.get("sightline_cap", 0)),
         hosting_fail_cap=int(unit.get("hosting_fail_cap", 0)),
         control_scores=_slug_map(_int_map(control.get("situations"), "control.situations")),
+        amenity_flags=amenity_flags,
+        luxury_tower=luxury_tower,
+        transit_min_distinct_routes=int(raw.get("transit_min_distinct_routes", 2)),
         access_points=_int_map(access.get("points"), "access.points"),
         hygiene_points=_int_map(hygiene.get("points"), "hygiene_outdoor.points"),
         amenity_trap_cap=int(hygiene.get("amenity_trap_cap", 0)),
@@ -265,24 +425,43 @@ def score_control(listing: Listing, card: Scorecard) -> CategoryScore:
 
 
 def score_access(listing: Listing, card: Scorecard, max_points: int) -> CategoryScore:
-    """Additive elevator/subway/laundry points, clamped to the category max."""
+    """Additive elevator/subway/laundry points, clamped to the category max.
+
+    Reads derived fields (has_elevator, distinct_transit_routes,
+    laundry_in_building) populated by enrich_listing; explicit booleans or the
+    legacy `floor_level`/`subway_lines_nearby` fields also work.
+    """
     earned: list[str] = []
     points = 0
 
     floor = _slug(str(listing.get("floor_level", "")))
+    unit_floor = listing.get("unit_floor")
+    low_floor = (
+        isinstance(unit_floor, int | float) and not isinstance(unit_floor, bool) and unit_floor <= 3
+    )
+    elevator_ok = (
+        listing.get("has_elevator") is True or floor in {"elevator", "walkup low"} or low_floor
+    )
     elevator_pts = card.access_points.get("elevator_or_low_walkup", 0)
-    if floor in {"elevator", "walkup low"} and elevator_pts:
+    if elevator_ok and elevator_pts:
         points += elevator_pts
         earned.append(f"elevator/low walk-up +{elevator_pts}")
 
+    routes = listing.get("distinct_transit_routes")
     lines = listing.get("subway_lines_nearby")
-    multi = (isinstance(lines, int | float) and not isinstance(lines, bool) and lines >= 2) or (
-        listing.get("walk_to_work_anchor") is True
+    multi = (
+        (
+            isinstance(routes, int | float)
+            and not isinstance(routes, bool)
+            and routes >= card.transit_min_distinct_routes
+        )
+        or (isinstance(lines, int | float) and not isinstance(lines, bool) and lines >= 2)
+        or (listing.get("walk_to_work_anchor") is True)
     )
     transit_pts = card.access_points.get("multi_line_or_walk_anchor", 0)
     if multi and transit_pts:
         points += transit_pts
-        earned.append(f"2+ subway lines or walk to work anchor +{transit_pts}")
+        earned.append(f"2+ transit routes or walk to work anchor +{transit_pts}")
 
     laundry_pts = card.access_points.get("laundry_in_building", 0)
     if listing.get("laundry_in_building") is True and laundry_pts:
@@ -301,19 +480,24 @@ def score_hygiene_outdoor(listing: Listing, card: Scorecard, max_points: int) ->
     points = 0
 
     checks = (
-        ("quiet_enough_to_sleep", "quiet enough to sleep"),
-        ("packages_safe", "packages safe"),
+        ("quiet_enough_to_sleep", "quiet enough to sleep", False),
+        ("packages_safe", "packages safe", listing.get("has_doorman") is True),
     )
-    for field_name, label in checks:
+    for field_name, label, fallback in checks:
         pts = card.hygiene_points.get(field_name, 0)
-        if listing.get(field_name) is True and pts:
+        value = resolve_flag(listing, field_name, fallback)
+        if value and pts:
             points += pts
             earned.append(f"{label} +{pts}")
 
     outdoor_pts = card.hygiene_points.get("usable_balcony_or_bookable_roof", 0)
-    if (
-        listing.get("usable_balcony") is True or listing.get("bookable_roof") is True
-    ) and outdoor_pts:
+    derived_roof = listing.get("has_roof_deck") is True
+    has_outdoor = (
+        resolve_flag(listing, "usable_balcony", False)
+        or resolve_flag(listing, "bookable_roof", derived_roof)
+        or derived_roof
+    )
+    if has_outdoor and outdoor_pts:
         points += outdoor_pts
         earned.append(f"usable balcony or bookable roof +{outdoor_pts}")
 
@@ -366,13 +550,14 @@ def score_listing(listing: Listing, card: Scorecard) -> ScoreResult:
     """Score one listing. Raises ValueError on missing/invalid required fields."""
     if not isinstance(listing, dict):
         raise ValueError("listing JSON must be an object")
+    enriched = enrich_listing(listing, card)
     breakdown = {
-        "location": score_location(listing, card),
-        "unit_function": score_unit_function(listing, card),
-        "control": score_control(listing, card),
-        "access": score_access(listing, card, card.category_max["access"]),
+        "location": score_location(enriched, card),
+        "unit_function": score_unit_function(enriched, card),
+        "control": score_control(enriched, card),
+        "access": score_access(enriched, card, card.category_max["access"]),
         "hygiene_outdoor": score_hygiene_outdoor(
-            listing, card, card.category_max["hygiene_outdoor"]
+            enriched, card, card.category_max["hygiene_outdoor"]
         ),
     }
     breakdown = {
@@ -380,7 +565,7 @@ def score_listing(listing: Listing, card: Scorecard) -> ScoreResult:
         for name, cs in breakdown.items()
     }
     total = sum(cs.points for cs in breakdown.values())
-    triggered = triggered_dealbreakers(listing, card)
+    triggered = triggered_dealbreakers(enriched, card)
     if triggered and total > card.dealbreaker_cap:
         total = card.dealbreaker_cap
     return ScoreResult(total=total, breakdown=breakdown, dealbreakers_triggered=triggered)
@@ -396,6 +581,43 @@ def result_to_dict(result: ScoreResult) -> dict[str, Any]:
             for name, cs in result.breakdown.items()
         },
     }
+
+
+# --------------------------------------------------------------------------- #
+# StreetEasy HTML parser (reserved — not yet implemented)
+# --------------------------------------------------------------------------- #
+def parse_streeteasy_html(html: str) -> Listing:
+    """Extract a listing dict from saved StreetEasy listing-page HTML.
+
+    Design (for a future iteration): the page is a Next.js App Router SSR
+    document. The deterministic payload lives in the ``self.__next_f`` Flight
+    chunks; the fields that matter map 1:1 onto this module's input schema:
+
+    - ``listing.pricing.price``                       -> ``price``
+    - ``building.area.name``                          -> ``neighborhood``
+    - ``listing.propertyDetails.livingAreaSize``      -> ``sqft``
+    - ``listing.propertyDetails.bedroomCount``/``roomCount`` -> ``bedrooms``/``rooms``
+    - ``listing.propertyDetails.amenities.list``      -> ``amenities``
+      (+ ``sharedOutdoorSpaceTypes`` flattened in; SCREAMING_SNAKE_CASE enum)
+    - ``listing.propertyDetails.address.displayUnit`` -> ``unit`` (floor parsed)
+    - ``building.floorCount`` / ``yearBuilt``         -> ``building_floor_count``
+      / ``building_year_built``
+    - ``building.nearby.transitStations``             -> ``transit_stations``
+    - ``building.aboutBuildingType``                  -> ``building_type``
+    - ``listing.media.floorPlans``                    -> ``floor_plan_count``
+
+    A JSON-LD block (``<script type="application/ld+json">``) duplicates most
+    of this (price, address, geo, amenityFeature in snake_case, transit) as a
+    fallback. Judgment fields (layout, bed_in_sightline, quiet, bookable
+    roof, living situation) stay manual — see README.
+
+    Note: plain HTTP fetches of streeteasy.com are PerimeterX-blocked; pages
+    must be saved from a browser session before parsing.
+    """
+    raise NotImplementedError(
+        "StreetEasy HTML parsing is not implemented yet; hand-author the "
+        "listing JSON from the page (see src/apartment_scorer/README.md)."
+    )
 
 
 # --------------------------------------------------------------------------- #
