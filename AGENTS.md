@@ -32,6 +32,14 @@ message on commit. To run the full suite manually:
   `Settings`; PNGs land in `outputs/rental_timing/`. Tests are in
   `tests/test_rental_timing.py` (math-only; no data I/O). Because the module
   lives in `src/`, mypy strict applies to it — see "Quality checks".
+- `src/apartment_scorer/` is a standalone PoC (argparse CLI, no pipeline
+  dependency) that scores a single listing JSON 0–100 against
+  `configs/apartment_scorecard.yaml`. All rubric numbers (category budgets,
+  per-neighborhood/layout scores, dealbreaker rules) live in that YAML —
+  retune there, not in `score.py`. Lookup strings are slug-normalized on
+  both sides (`"Hell's Kitchen"` == `hells_kitchen`), so YAML keys must stay
+  in slug form. Tests: `tests/test_apartment_scorer.py` (logic-only; imports
+  `apartment_scorer.score` via the editable install's `src/` path).
 
 ## Quality checks
 

@@ -1,0 +1,167 @@
+# Apartment listing scorecard (0–100) for a single structured listing JSON.
+#
+# Read by src/apartment_scorer/score.py. Mirrors the philosophy of the
+# repo-level weights.yaml: all tunable numbers live here; scoring logic
+# lives in Python. Edit this file to retune the rubric without code changes.
+#
+# Category maxima must sum to 100. Points within a category are clamped to
+# the category max so a generous mapping cannot overflow its budget.
+#
+# Dealbreakers do not zero the score: if any rule matches, the total is
+# capped at `dealbreaker_cap` and the matched rule names are reported.
+
+# --------------------------------------------------------------------------- #
+# Category budgets (must sum to 100)
+# --------------------------------------------------------------------------- #
+category_max:
+  location: 30
+  unit_function: 30
+  control: 15
+  access: 15
+  hygiene_outdoor: 10
+
+# Cap applied to the total when any dealbreaker matches.
+dealbreaker_cap: 49
+
+# --------------------------------------------------------------------------- #
+# Location (max 30) — fixed score per neighborhood, from the scorecard bands:
+#   25–30: Chelsea; Flatiron/Gramercy/Union Square north; selective WV/GV
+#   18–24: Hell's Kitchen 8th–11th; Fort Greene/Boerum Hill/BK Heights edge;
+#          unfashionable EV/LES blocks
+#   10–17: Greenpoint / off-waterfront Williamsburg; UWS 60s–low 70s
+#   0–9:   LIC, FiDi, UES, deep UWS, Bushwick as home, Jersey
+# Keys are lowercase, punctuation-stripped names; aliases of a lookup name
+# are all listed (score.py normalizes the input the same way).
+# Unlisted neighborhoods fall back to `default` with a stderr warning.
+# --------------------------------------------------------------------------- #
+location:
+  default: 10
+  neighborhoods:
+    # 25–30 band
+    chelsea: 28
+    flatiron: 27
+    flatiron district: 27
+    gramercy: 27
+    gramercy park: 27
+    union square north: 27
+    west village: 26
+    greenwich village: 26
+    # 18–24 band
+    hells kitchen: 21
+    clinton: 21
+    fort greene: 21
+    boerum hill: 21
+    brooklyn heights: 20
+    east village: 19
+    lower east side: 19
+    les: 19
+    # 10–17 band
+    greenpoint: 14
+    williamsburg: 13
+    north williamsburg: 13
+    upper west side: 13
+    uws: 13
+    astoria: 10
+    clinton hill: 10
+    prospect heights: 10
+    downtown brooklyn: 9
+    # 0–9 band
+    long island city: 4
+    lic: 4
+    fidi: 4
+    financial district: 4
+    upper east side: 4
+    ues: 4
+    midtown east: 4
+    murray hill: 4
+    turtle bay: 4
+    sutton place: 4
+    deep upper west side: 3
+    bushwick: 5
+    hoboken: 3
+    jersey city: 3
+
+# --------------------------------------------------------------------------- #
+# Unit function (max 30) — per-layout score, then demotion overrides:
+#   - bed_in_sightline: cap at the sightline-cap band ("bed is the living
+#     room" tour test — scored as a studio no matter the listing title).
+#   - large_zoned_studio requires sqft >= studio_large_min_sqft, else it is
+#     demoted to small_open_studio points.
+#   - seats_four_without_bed == false: hosting fail, cap at
+#     hosting_fail_cap.
+# Overrides apply in order; each can only lower the score.
+# --------------------------------------------------------------------------- #
+unit_function:
+  studio_large_min_sqft: 500
+  sightline_cap: 14
+  hosting_fail_cap: 14
+  layouts:
+    true_1br: 28
+    alcove_1br: 26
+    junior_1br: 26
+    large_zoned_studio: 20
+    small_open_studio: 7
+    open_studio: 7
+    railroad: 7
+    fake_1br: 7
+
+# --------------------------------------------------------------------------- #
+# Control (max 15)
+# --------------------------------------------------------------------------- #
+control:
+  situations:
+    solo: 15
+    known_roommate: 10
+    new_roommates: 0
+
+# --------------------------------------------------------------------------- #
+# Access (max 15) — additive points, clamped to the category max.
+# --------------------------------------------------------------------------- #
+access:
+  points:
+    elevator_or_low_walkup: 6
+    multi_line_or_walk_anchor: 5
+    laundry_in_building: 4
+
+# --------------------------------------------------------------------------- #
+# Hygiene / outdoor (max 10) — additive points, clamped to the category max.
+# amenity_trap (trophy finishes, sliver balcony, unbookable roof, gym you'll
+# ignore) caps the whole category at amenity_trap_cap.
+# --------------------------------------------------------------------------- #
+hygiene_outdoor:
+  amenity_trap_cap: 5
+  points:
+    quiet_enough_to_sleep: 3
+    packages_safe: 2
+    usable_balcony_or_bookable_roof: 3
+
+# --------------------------------------------------------------------------- #
+# Dealbreakers — each rule matches when every `when` condition holds.
+# `when` values may be scalars (exact match) or lists (match any).
+# `min`/`max` on a numeric field compare inclusively.
+# --------------------------------------------------------------------------- #
+dealbreakers:
+  - name: two_plus_new_roommates
+    when:
+      living_situation: new_roommates
+  - name: bed_in_sightline_open_studio
+    when:
+      bed_in_sightline: true
+      layout: [small_open_studio, open_studio]
+  - name: lounge_roof_as_party_apartment
+    when:
+      relying_on_common_space: true
+  - name: lic_or_downtown_brooklyn_tower_plan
+    when:
+      neighborhood: [long island city, lic, downtown brooklyn]
+      building_type: luxury_tower
+  - name: midtown_east_identity_move
+    when:
+      neighborhood: [midtown east, murray hill, turtle bay, sutton place]
+  - name: thousand_dollar_amenity_premium
+    when:
+      amenity_premium_over_comps: {min: 1000}
+  - name: five_flight_walkup_hosting
+    when:
+      floor_level: walkup_high
+      intends_to_host: true
