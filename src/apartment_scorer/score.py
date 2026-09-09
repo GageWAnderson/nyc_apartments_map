@@ -70,6 +70,18 @@ class LuxuryTowerRule:
 
 
 @dataclass(frozen=True)
+class TrophyTrapRule:
+    """Derive ``amenity_trap`` from the trophy-amenity stack (pool, media room…).
+
+    The heuristic fires when the building has at least ``min_amenities`` of the
+    mapped trophy amenities AND any of the extra ``require_any_flags`` present.
+    """
+
+    min_amenities: int
+    require_any_flags: list[str]
+
+
+@dataclass(frozen=True)
 class Scorecard:
     """Parsed + validated contents of the scorecard YAML."""
 
@@ -84,10 +96,12 @@ class Scorecard:
     control_scores: dict[str, int]
     amenity_flags: dict[str, list[str]]
     luxury_tower: LuxuryTowerRule
+    trophy_trap: TrophyTrapRule
     transit_min_distinct_routes: int
     access_points: dict[str, int]
     hygiene_points: dict[str, int]
     amenity_trap_cap: int
+    flag_scores: dict[str, int]
     dealbreakers: list[DealbreakerRule]
 
 
@@ -141,11 +155,30 @@ def _slug_map(mapping: dict[str, int]) -> dict[str, int]:
 # --------------------------------------------------------------------------- #
 # Deterministic derivations (pure)
 # --------------------------------------------------------------------------- #
+def _bound_to_building(floor: int | None, building_floor_count: int | None) -> int | None:
+    """Clamp an implausible parse against the building's known floor count.
+
+    Numeric tower units encode floor+line ("#1020" -> floor 10, line 20), so a
+    naive digit parse over-reads ("1020" in a 62-story building). Drop trailing
+    digits until the value fits; a still-implausible result means the unit
+    naming scheme isn't floor-derived and we return None instead of nonsense.
+    """
+    if floor is None or building_floor_count is None:
+        return floor
+    if 1 <= building_floor_count <= 999 and floor > building_floor_count:
+        while floor and floor > building_floor_count:
+            floor //= 10
+        return floor or None
+    return floor
+
+
 def floor_from_unit(unit: Any, building_floor_count: int | None) -> int | None:
     """Parse the floor number from a unit designator like '#18A', '3R', 'PH2'.
 
     Returns None when no digits are present. Penthouse designators map to the
-    building's floor count when it is known.
+    building's floor count when it is known. Long numeric units ("#1020" in a
+    62-story building) are bounded against the known floor count so the parse
+    stays plausible.
     """
     if not isinstance(unit, str):
         return None
@@ -153,18 +186,18 @@ def floor_from_unit(unit: Any, building_floor_count: int | None) -> int | None:
     if text.startswith("PH"):
         ph_digits = re.match(r"PH(\d+)", text)
         if ph_digits:
-            return int(ph_digits.group(1))
+            return _bound_to_building(int(ph_digits.group(1)), building_floor_count)
         return building_floor_count
     digits = re.match(r"\d+", text)
     if digits:
-        return int(digits.group())
+        return _bound_to_building(int(digits.group()), building_floor_count)
     # Letter-prefixed unit: the embedded digit run is the floor ("S20M"->20,
     # "N10A"->10). Multi-word tower designators ("WEST-TOWER-11B") are excluded
     # — too ambiguous to parse reliably.
     if "-" not in text:
         embedded = re.search(r"(\d+)", text)
         if embedded:
-            return int(embedded.group(1))
+            return _bound_to_building(int(embedded.group(1)), building_floor_count)
     return None
 
 
@@ -202,6 +235,29 @@ def distinct_transit_routes(listing: Listing) -> int:
             if isinstance(station_routes, list):
                 routes.update(str(r).strip().upper() for r in station_routes)
     return len(routes)
+
+
+def derive_amenity_trap(listing: Listing, card: Scorecard, flags: dict[str, bool]) -> bool:
+    """True when the trophy-amenity stack signals an amenity trap.
+
+    Fires when at least ``min_amenities`` trophy amenities are present AND any
+    of the extra ``require_any_flags`` is set. An explicit ``amenity_trap``
+    boolean on the listing always wins (checked by the caller via ``enrich``).
+    """
+    rule = card.trophy_trap
+    if rule.min_amenities <= 0:
+        return False
+    raw = listing.get("amenities", [])
+    present = {_slug(a) for a in raw} if isinstance(raw, list) else set()
+    trophy_enums = {
+        _slug(e)
+        for flag, enums in card.amenity_flags.items()
+        if flag.startswith("trophy_")
+        for e in enums
+    }
+    trophy_count = len(present & trophy_enums)
+    extra = any(flags.get(flag, False) for flag in rule.require_any_flags)
+    return trophy_count >= rule.min_amenities and extra
 
 
 _SCORECARD_BUILDING_CLASSES = {
@@ -268,6 +324,8 @@ def enrich_listing(listing: Listing, card: Scorecard) -> Listing:
         )
     if "effective_building_class" not in enriched:
         enriched["effective_building_class"] = effective_building_class(listing, card, enriched)
+    if not isinstance(enriched.get("amenity_trap"), bool):
+        enriched["amenity_trap"] = derive_amenity_trap(listing, card, enriched)
     return enriched
 
 
@@ -320,6 +378,18 @@ def load_scorecard(path: Path) -> Scorecard:
         require_flags=[str(f) for f in require_flags],
     )
 
+    trap_raw = _as_mapping(
+        _as_mapping(raw.get("building_class", {}), "building_class").get("trophy_trap", {}),
+        "building_class.trophy_trap",
+    )
+    trap_flags = trap_raw.get("require_any_flags", [])
+    if not isinstance(trap_flags, list) or not all(isinstance(f, str) for f in trap_flags):
+        raise ValueError("building_class.trophy_trap.require_any_flags must be a list of strings")
+    trophy_trap = TrophyTrapRule(
+        min_amenities=int(trap_raw.get("min_amenities", 0)),
+        require_any_flags=[str(f) for f in trap_flags],
+    )
+
     rules: list[DealbreakerRule] = []
     for i, entry in enumerate(_as_list(need("dealbreakers"), "dealbreakers")):
         rule = _as_mapping(entry, f"dealbreakers[{i}]")
@@ -345,10 +415,17 @@ def load_scorecard(path: Path) -> Scorecard:
         control_scores=_slug_map(_int_map(control.get("situations"), "control.situations")),
         amenity_flags=amenity_flags,
         luxury_tower=luxury_tower,
+        trophy_trap=trophy_trap,
         transit_min_distinct_routes=int(raw.get("transit_min_distinct_routes", 2)),
         access_points=_int_map(access.get("points"), "access.points"),
         hygiene_points=_int_map(hygiene.get("points"), "hygiene_outdoor.points"),
         amenity_trap_cap=int(hygiene.get("amenity_trap_cap", 0)),
+        flag_scores=_int_map(
+            _as_mapping(raw.get("amenity_flags_score", {}), "amenity_flags_score").get(
+                "points", {}
+            ),
+            "amenity_flags_score.points",
+        ),
         dealbreakers=rules,
     )
 
@@ -513,10 +590,12 @@ def score_hygiene_outdoor(listing: Listing, card: Scorecard, max_points: int) ->
             earned.append(f"{label} +{pts}")
 
     outdoor_pts = card.hygiene_points.get("usable_balcony_or_bookable_roof", 0)
+    private = listing.get("has_private_outdoor") is True
     derived_roof = listing.get("has_roof_deck") is True
     has_outdoor = (
-        resolve_flag(listing, "usable_balcony", False)
+        resolve_flag(listing, "usable_balcony", private)
         or resolve_flag(listing, "bookable_roof", derived_roof)
+        or private
         or derived_roof
     )
     if has_outdoor and outdoor_pts:
@@ -531,6 +610,29 @@ def score_hygiene_outdoor(listing: Listing, card: Scorecard, max_points: int) ->
     if clamped < points:
         earned.append(f"clamped to category max {max_points}")
     return CategoryScore(clamped, earned or ["no hygiene/outdoor features"])
+
+
+# --------------------------------------------------------------------------- #
+# Amenity flags (binary add-ons)
+# --------------------------------------------------------------------------- #
+def score_amenity_flags(listing: Listing, card: Scorecard, max_points: int) -> CategoryScore:
+    """Additive 0/1 points for derived amenity flags, clamped to the category max.
+
+    Each key in ``amenity_flags_score.points`` is a flag name (derived by
+    ``enrich_listing`` or an explicit boolean on the listing); when the flag is
+    true the listing earns that many points. Small by design — these are binary
+    presence signals layered on top of the main categories.
+    """
+    earned: list[str] = []
+    points = 0
+    for flag, pts in card.flag_scores.items():
+        if listing.get(flag) is True and pts:
+            points += pts
+            earned.append(f"{flag} +{pts}")
+    clamped = min(points, max_points)
+    if clamped < points:
+        earned.append(f"clamped to category max {max_points}")
+    return CategoryScore(clamped, earned or ["no amenity flags"])
 
 
 # --------------------------------------------------------------------------- #
@@ -580,6 +682,9 @@ def score_listing(listing: Listing, card: Scorecard) -> ScoreResult:
         "access": score_access(enriched, card, card.category_max["access"]),
         "hygiene_outdoor": score_hygiene_outdoor(
             enriched, card, card.category_max["hygiene_outdoor"]
+        ),
+        "amenity_flags_score": score_amenity_flags(
+            enriched, card, card.category_max["amenity_flags_score"]
         ),
     }
     breakdown = {
@@ -790,6 +895,66 @@ def _first_positive_number(raw: dict[str, Any], *keys: str) -> int | float | Non
     return None
 
 
+def _first_nonnegative_number(raw: dict[str, Any], *keys: str) -> int | float | None:
+    """First key holding a number >= 0; unlike _first_positive_number, 0 is kept
+    (0 bedrooms is "studio", not "unknown")."""
+    for key in keys:
+        value = raw.get(key)
+        if isinstance(value, int | float) and not isinstance(value, bool) and value >= 0:
+            return value
+    return None
+
+
+def _has_price_drop(raw: dict[str, Any]) -> bool:
+    """True when the pricing_priceChanges_json history shows a price cut."""
+    blob = raw.get("pricing_priceChanges_json")
+    if not isinstance(blob, str) or not blob.strip():
+        return False
+    try:
+        changes = json.loads(blob)
+    except json.JSONDecodeError:
+        return False
+    prices: list[int | float] = [
+        c["price"]
+        for c in changes
+        if isinstance(c, dict)
+        and isinstance(c.get("price"), int | float)
+        and not isinstance(c.get("price"), bool)
+    ]
+    return len(prices) >= 2 and prices[-1] < prices[0]
+
+
+_LAYOUT_KEYWORD_RULES: tuple[tuple[str, str], ...] = (
+    # (layout slug, regex against the lowercased description). First match wins.
+    ("alcove_1br", r"\balcove\b"),
+    ("junior_1br", r"\bjunior\b"),
+    ("fake_1br", r"\b(flex|convertible|pressurized wall|partition)\b"),
+    ("railroad", r"\brailroad\b"),
+    ("loft", r"\bloft\b"),
+)
+
+
+def infer_layout(raw: dict[str, Any]) -> str | None:
+    """Best-effort layout from description keywords + bedroom count + sqft.
+
+    Conservative keyword hits win (alcove/junior/flex/railroad). Otherwise fall
+    back on the bedroom count: 0 beds -> a studio (zoned-large when the area
+    clears 500 sqft), 1+ beds -> a plain 1BR. Returns None when nothing is known.
+    An explicit ``layout`` on the entry always wins (checked by the caller).
+    """
+    description = str(raw.get("description") or "").lower()
+    for layout, pattern in _LAYOUT_KEYWORD_RULES:
+        if re.search(pattern, description):
+            return layout
+    bedrooms = _first_nonnegative_number(raw, "bedroomCount", "propertyDetails_bedroomCount")
+    if bedrooms is None:
+        return None
+    sqft = _first_positive_number(raw, "livingAreaSize", "propertyDetails_livingAreaSize")
+    if bedrooms == 0:
+        return "large_zoned_studio" if (sqft is not None and sqft >= 500) else "small_open_studio"
+    return "true_1br"
+
+
 def _detail_unit(raw: dict[str, Any]) -> str | None:
     """Unit designator from the detail export's `unit`/`displayUnit` ('#2L' -> '2L')."""
     for key in ("unit", "displayUnit"):
@@ -830,10 +995,13 @@ def _normalize_detail_export(raw: dict[str, Any]) -> Listing:
     if unit:
         listing["unit"] = unit
 
+    if raw.get("furnished") is True:
+        listing["furnished"] = True
+
     price = _first_positive_number(raw, "price", "rent")
     if price is not None:
         listing["price"] = price
-    bedrooms = _first_positive_number(raw, "bedroomCount", "propertyDetails_bedroomCount")
+    bedrooms = _first_nonnegative_number(raw, "bedroomCount", "propertyDetails_bedroomCount")
     if bedrooms is not None:
         listing["bedrooms"] = bedrooms
     rooms = _first_positive_number(raw, "propertyDetails_roomCount")
@@ -854,6 +1022,8 @@ def _normalize_detail_export(raw: dict[str, Any]) -> Listing:
     for key in (
         "propertyDetails_amenities_list",
         "propertyDetails_amenities_sharedOutdoorSpaceTypes",
+        "propertyDetails_features_list",
+        "propertyDetails_features_privateOutdoorSpaceTypes",
     ):
         values = raw.get(key)
         if isinstance(values, list):
@@ -862,6 +1032,18 @@ def _normalize_detail_export(raw: dict[str, Any]) -> Listing:
                     amenities.append(value)
     if amenities:
         listing["amenities"] = amenities
+
+    # Doorman type refines packages_safe: a VIRTUAL doorman doesn't reliably
+    # accept packages, so don't give the doorman-derived packages_safe credit.
+    doorman_types = raw.get("propertyDetails_amenities_doormanTypes")
+    if isinstance(doorman_types, list) and "VIRTUAL" in doorman_types:
+        listing["packages_safe"] = False
+
+    # Private outdoor space (BALCONY/TERRACE/GARDEN/PRIVATE_ROOF_DECK) is the
+    # real usable-balcony evidence; the shared ROOF_DECK flag is weaker.
+    private_outdoor = raw.get("propertyDetails_features_privateOutdoorSpaceTypes")
+    if isinstance(private_outdoor, list) and private_outdoor:
+        listing["usable_balcony"] = True
 
     floors = _first_positive_number(raw, "floorCount", "floor_count", "stories")
     if floors is not None:
@@ -876,6 +1058,25 @@ def _normalize_detail_export(raw: dict[str, Any]) -> Listing:
         if url.startswith("/"):
             url = "https://streeteasy.com" + url
         listing["source_url"] = url
+
+    net_effective = _first_positive_number(
+        raw, "netEffectivePrice", "net_effective_rent", "pricing_netEffectiveRent"
+    )
+    if net_effective is not None:
+        listing["net_effective_rent"] = net_effective
+    months_free = _first_positive_number(raw, "monthsFree", "months_free", "pricing_monthsFree")
+    if months_free is not None:
+        listing["months_free"] = months_free
+    days_on_market = _first_nonnegative_number(raw, "daysOnMarket", "days_on_market")
+    if days_on_market is not None:
+        listing["days_on_market"] = days_on_market
+    if _has_price_drop(raw):
+        listing["price_dropped"] = True
+
+    if "layout" not in raw:
+        inferred = infer_layout(raw)
+        if inferred is not None:
+            listing["layout"] = inferred
 
     median = raw.get("recentListingsPriceStats_rentalPriceStats_medianPrice")
     if (
@@ -1002,6 +1203,9 @@ def score_search_listing(raw: dict[str, Any], card: Scorecard) -> BatchRow:
     breakdown["hygiene_outdoor"] = score_hygiene_outdoor(
         enriched, card, card.category_max["hygiene_outdoor"]
     )
+    breakdown["amenity_flags_score"] = score_amenity_flags(
+        enriched, card, card.category_max["amenity_flags_score"]
+    )
     breakdown = {
         name: CategoryScore(min(cs.points, card.category_max[name]), cs.reasons)
         for name, cs in breakdown.items()
@@ -1110,7 +1314,8 @@ def parse_streeteasy_html(html: str) -> Listing:
     - ``listing.propertyDetails.livingAreaSize``      -> ``sqft``
     - ``listing.propertyDetails.bedroomCount``/``roomCount`` -> ``bedrooms``/``rooms``
     - ``listing.propertyDetails.amenities.list``      -> ``amenities``
-      (+ ``sharedOutdoorSpaceTypes`` flattened in; SCREAMING_SNAKE_CASE enum)
+      (+ ``sharedOutdoorSpaceTypes`` + ``features.list`` +
+      ``features.privateOutdoorSpaceTypes`` flattened in; SCREAMING_SNAKE_CASE)
     - ``listing.propertyDetails.address.displayUnit`` -> ``unit`` (floor parsed)
     - ``building.floorCount`` / ``yearBuilt``         -> ``building_floor_count``
       / ``building_year_built``

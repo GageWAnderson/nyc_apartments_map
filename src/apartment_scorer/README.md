@@ -73,12 +73,20 @@ SCORE  ADDRESS                                    PRICE BD  LAYOUT             F
 |---|---|---|
 | `listingAddress` (else `street` + `unit`/`displayUnit`) | `name` + `unit` | `#` stripped from the unit; floor parsed (`#2L`→2) |
 | `price` (else `rent`) | `price` | |
-| `bedroomCount` | `bedrooms` | `0` → omitted |
+| `bedroomCount` | `bedrooms` | `0` = studio (kept) — feeds layout inference |
 | `propertyDetails_roomCount` | `rooms` | real room count (legacy shape approximates from bedrooms) |
 | `livingAreaSize` (else `propertyDetails_livingAreaSize`) | `sqft` | `0`/`null` (unknown) → omitted |
 | `areaName` | `neighborhood` | `"Hell's Kitchen"` scores 21 |
 | `buildingType` | `building_type` | e.g. `"RENTAL"` — informational only |
-| `propertyDetails_amenities_list` + `propertyDetails_amenities_sharedOutdoorSpaceTypes` | `amenities` | flattened + deduped; `ROOF_DECK` lives in the second list |
+| `propertyDetails_amenities_list` + `propertyDetails_amenities_sharedOutdoorSpaceTypes` + `propertyDetails_features_list` + `propertyDetails_features_privateOutdoorSpaceTypes` | `amenities` | flattened + deduped; `ROOF_DECK` in shared-outdoor, `WASHER_DRYER`/`DISHWASHER`/`BALCONY` in features |
+| `propertyDetails_amenities_doormanTypes` | `packages_safe` | `VIRTUAL` → `packages_safe: false` |
+| `propertyDetails_features_privateOutdoorSpaceTypes` (non-empty) | `usable_balcony` | `true` (BALCONY/TERRACE/GARDEN/PRIVATE_ROOF_DECK) |
+| `netEffectivePrice` | `net_effective_rent` | rent after concessions |
+| `monthsFree` | `months_free` | concession |
+| `daysOnMarket` | `days_on_market` | feeds the stale-listing flag |
+| `pricing_priceChanges_json` | `price_dropped` | `true` when the history shows a cut |
+| `description` + `bedroomCount` + `sqft` | `layout` | inferred (alcove/flex/junior keywords; else studio/1BR by beds+sqft) — explicit `layout` wins |
+| `furnished` | `furnished` | feeds the furnished dealbreaker |
 | `floorCount` (else `floor_count`/`stories`) | `building_floor_count` | |
 | `yearBuilt` (else `year_built`) | `building_year_built` | `0` → omitted |
 | `urlPath` | `source_url` | relative paths prefixed with `https://streeteasy.com` |
@@ -107,14 +115,16 @@ values, so you can enrich individual rows.
 
 ### Null-safe scoring (why every export row gets a score)
 
-Search exports never carry `layout` or `living_situation`. Rather than drop
-those rows, batch mode scores them **null-safely**: the missing category
-(`unit_function` and/or `control`) scores **0 with a warning**, and the row
-still ranks on its deterministic categories (location, access, hygiene).
-Rows with warnings are flagged `~partial` in the table; rows with
-dealbreakers get `!name`. To fully score a row, add `layout` /
-`living_situation` (and ideally `amenities`) to its export entry — they pass
-through.
+Search exports never carry `living_situation` (a per-hunt preference, not a
+listing fact), and may not carry `layout`. Rather than drop those rows, batch
+mode scores them **null-safely**: the missing category scores **0 with a
+warning**, and the row still ranks on its deterministic categories. `layout`
+is now **inferred** for detail exports (description keywords + bedroom count +
+sqft), so most rows earn unit-function points; `control` still scores 0 until
+you set a batch-wide `living_situation`. Rows with warnings are flagged
+`~partial` in the table; rows with dealbreakers get `!name`. To fully score a
+row, add `layout` / `living_situation` (and ideally `amenities`) to its export
+entry — they pass through.
 
 ### Dedupe & ranking
 
@@ -159,9 +169,10 @@ Two kinds of fields:
 
 | Derived field | Rule |
 |---|---|
-| `laundry_in_building`, `has_elevator`, `has_doorman`, `has_gym`, `has_roof_deck`, `has_shared_outdoor` | `amenities` ∩ `amenity_flags` map in the YAML |
+| `laundry_in_building`, `has_elevator`, `has_doorman`, `has_gym`, `has_roof_deck`, `has_shared_outdoor`, `has_washer_dryer`, `has_dishwasher`, `has_central_ac`, `has_private_outdoor`, `has_package_room`, `has_bike_room`, `has_storage`, `has_parking`, `has_pool`, `trophy_*` | `amenities` ∩ `amenity_flags` map in the YAML |
 | `distinct_transit_routes` | union of `transit_stations[].routes` |
-| `unit_floor` | parsed from `unit` |
+| `unit_floor` | parsed from `unit`, bounded by `building_floor_count` (e.g. `#1020` in a 62-story tower → 10) |
+| `amenity_trap` | derived from the trophy stack (`building_class.trophy_trap` in the YAML): ≥ `min_amenities` trophy amenities **and** any `require_any_flags` present |
 | `effective_building_class` | `luxury_tower` when `building_floor_count ≥ 20` **and** `building_year_built ≥ 1990` **and** `has_doorman` **and** `has_gym`; else `elevator_building` (has elevator) / `walkup` (floor count known) / `unknown`. Thresholds live in `building_class.luxury_tower` in the YAML. |
 
 ### Manual fields (tour test / judgment)
@@ -182,9 +193,11 @@ Two kinds of fields:
 | `relying_on_common_space` | bool | Lounge/roof as substitute living room (dealbreaker) |
 | `intends_to_host` | bool | Gates the 5-flight walk-up dealbreaker |
 
-`layout` stays manual on purpose: StreetEasy's `bedroomCount`/`roomCount`
-can't distinguish a true 1BR from an alcove with a door or a
-pressurized-wall "1BR". Decision procedure (the tour test):
+`layout` is manual for hand-authored single listings (StreetEasy's
+`bedroomCount`/`roomCount` can't distinguish a true 1BR from an alcove with a
+door or a pressurized-wall "1BR"). In **batch mode** it is inferred from
+`description` keywords + `bedroomCount` + `sqft` when not explicitly set — an
+explicit `layout` on an entry always wins. Decision procedure (the tour test):
 
 1. `bedrooms ≥ 1` **and** a real door on the bedroom **and** a sitting zone
    → `true_1br`
@@ -215,8 +228,14 @@ Lookup strings everywhere are slug-normalized on both sides, so
    `unit_floor ≤ 3`) 6 + multi-line-or-walk-anchor
    (`distinct_transit_routes ≥ 2` or anchor) 5 + laundry in-building 4,
    clamped to 15.
-5. **Hygiene / outdoor (10)** — quiet 3 + packages-safe (doorman) 2 + usable
-   balcony *or* bookable/derived roof 3; `amenity_trap` caps the category at 5.
+5. **Hygiene / outdoor (7)** — quiet 3 + packages-safe (doorman; a `VIRTUAL`
+   doorman doesn't count) 2 + usable balcony *or* bookable/derived roof 3
+   (private outdoor space preferred); `amenity_trap` caps the category at 5.
+6. **Amenity flags (3)** — small binary add-ons, one point each, for the
+   parsed building/unit feature set (`has_washer_dryer`, `has_dishwasher`,
+   `has_central_ac`, `has_private_outdoor`, `has_package_room`, `has_bike_room`,
+   `has_storage`, `has_parking`, `has_pool`), clamped to 3. The 7 points moved
+   here from hygiene are yours to retune in `amenity_flags_score.points`.
 
 **Dealbreakers** never zero the score: any matched rule caps the total at
 `dealbreaker_cap` (49) and is listed by name in `--explain` output. Rules

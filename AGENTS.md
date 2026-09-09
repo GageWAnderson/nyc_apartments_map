@@ -54,13 +54,27 @@ message on commit. To run the full suite manually:
   `urlPath`/`recentListingsPriceStats_*`) and the **legacy Apify search
   export** (`address`/`price`/`bedrooms`/`squareFeet`/`neighborhood`/`url`).
   `normalize_search_listing()` maps either shape (zero/empty = unknown →
-  omitted; `amenities` flattens `amenities_list` + `sharedOutdoorSpaceTypes`;
-  `amenity_premium_over_comps` is derived as price − area-median rent when
-  positive; scorer-native fields pass through and win), dedupes on
+  omitted, except `bedrooms: 0` = studio is kept; `amenities` flattens
+  `amenities_list` + `sharedOutdoorSpaceTypes` + `features_list` +
+  `features_privateOutdoorSpaceTypes`; `VIRTUAL` doorman → `packages_safe:
+  false`; non-empty `privateOutdoorSpaceTypes` → `usable_balcony: true`;
+  `netEffectivePrice`/`monthsFree`/`daysOnMarket`/`pricing_priceChanges_json`
+  → `net_effective_rent`/`months_free`/`days_on_market`/`price_dropped`;
+  `layout` is inferred from description keywords + bedroomCount + sqft when
+  not explicit; `amenity_premium_over_comps` is derived as price − area-median
+  rent when positive; scorer-native fields pass through and win), dedupes on
   address+price (featured/infeed URLs collapse), scores **null-safely**
   (missing `layout`/`living_situation` → that category 0 + warning, row still
    ranks), and prints a ranked table (`--json PATH` dumps full breakdowns).
-   Sample exports under `data/listings/`.
+   Sample exports under `data/listings/`. A sixth category
+   `amenity_flags_score` (budget 3, taken from `hygiene_outdoor`'s old 10)
+   awards 1 pt per derived binary flag (`has_washer_dryer`, `has_dishwasher`,
+   `has_central_ac`, `has_private_outdoor`, `has_package_room`, `has_bike_room`,
+   `has_storage`, `has_parking`, `has_pool`), clamped — retune in
+   `amenity_flags_score.points`. `amenity_trap` is derived from the trophy
+   stack via `building_class.trophy_trap` (≥ `min_amenities` trophy amenities
+   AND any `require_any_flags`). `floor_from_unit()` bounds long numeric units
+   against `building_floor_count` (`#1020` in a 62-story tower → 10).
 - `src/streeteasy_scraper/` is a standalone PoC (argparse CLI, no pipeline
   dependency) that runs the Apify actor `memo23/streeteasy-ppr`
   (`ptsXZUXADV3OKZ5kd`) and writes the dataset to

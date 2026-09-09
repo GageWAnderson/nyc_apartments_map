@@ -18,7 +18,8 @@ category_max:
   unit_function: 30
   control: 15
   access: 15
-  hygiene_outdoor: 10
+  hygiene_outdoor: 7
+  amenity_flags_score: 3
 
 # Cap applied to the total when any dealbreaker matches.
 dealbreaker_cap: 49
@@ -42,14 +43,19 @@ location:
     west chelsea: 26
     flatiron: 27
     flatiron district: 27
+    nomad: 27
     gramercy: 27
     gramercy park: 27
     union square north: 27
     west village: 26
     greenwich village: 26
+    soho: 25
     # 18–24 band
     hells kitchen: 21
     clinton: 21
+    hudson yards: 20
+    hudson square: 20
+    nolita: 19
     fort greene: 21
     boerum hill: 21
     brooklyn heights: 20
@@ -120,6 +126,9 @@ control:
 # SCREAMING_SNAKE_CASE strings from the listing payload's
 # propertyDetails.amenities.list (JSON-LD amenityFeature uses the same names
 # in snake_case; the scorer normalizes both sides, so either casing works).
+# The batch normalizer flattens amenities.list + sharedOutdoorSpaceTypes +
+# features.list + features.privateOutdoorSpaceTypes into `amenities`, so
+# WASHER_DRYER / DISHWASHER / BALCONY / ... (unit features) map here too.
 # A flag is true when ANY listed amenity is present in the listing's
 # `amenities` array. Explicit boolean fields on the listing (e.g.
 # laundry_in_building: true) override the derived flag.
@@ -130,7 +139,23 @@ amenity_flags:
   has_doorman: [DOORMAN, CONCIERGE]
   has_gym: [GYM]
   has_roof_deck: [ROOF_DECK]
-  has_shared_outdoor: [GARDEN, PATIO, SHARED_OUTDOOR_SPACE]
+  has_shared_outdoor: [GARDEN, PATIO, SHARED_OUTDOOR_SPACE, COURTYARD]
+  # unit features (from propertyDetails.features.list)
+  has_washer_dryer: [WASHER_DRYER]
+  has_dishwasher: [DISHWASHER]
+  has_central_ac: [CENTRAL_AC]
+  has_private_outdoor: [PRIVATE_OUTDOOR_SPACE, BALCONY, TERRACE, PRIVATE_ROOF_DECK]
+  # building extras
+  has_package_room: [PACKAGE_ROOM]
+  has_bike_room: [BIKE_ROOM]
+  has_storage: [STORAGE_SPACE]
+  has_parking: [PARKING]
+  has_pool: [POOL]
+  # trophy stack -> amenity_trap heuristic (see building_class.trophy_trap)
+  trophy_pool: [POOL, HOT_TUB]
+  trophy_media: [MEDIA_ROOM]
+  trophy_playroom: [CHILDRENS_PLAYROOM]
+  trophy_valet: [VALET_SERVICE]
 
 # Heuristic for `effective_building_class` (drives the LIC/DTBK tower
 # dealbreaker). `luxury_tower` requires: building floor count >= min_floors,
@@ -142,6 +167,12 @@ building_class:
     min_floors: 20
     min_year: 1990
     require_flags: [has_doorman, has_gym]
+  # Derives `amenity_trap` (caps hygiene_outdoor) from the trophy stack:
+  # fires when >= min_amenities trophy_* flags are present AND any of
+  # require_any_flags is also present. Explicit amenity_trap on a listing wins.
+  trophy_trap:
+    min_amenities: 3
+    require_any_flags: [trophy_pool, trophy_valet]
 
 # Minimum distinct transit routes (union of `transit_stations[].routes`)
 # that counts as "multiple lines" for access points.
@@ -160,12 +191,13 @@ access:
     laundry_in_building: 4
 
 # --------------------------------------------------------------------------- #
-# Hygiene / outdoor (max 10) — additive points, clamped to the category max.
+# Hygiene / outdoor (max 7) — additive points, clamped to the category max.
 # amenity_trap (trophy finishes, sliver balcony, unbookable roof, gym you'll
 # ignore) caps the whole category at amenity_trap_cap.
 # packages_safe is derived from the has_doorman flag (override with an
-# explicit packages_safe boolean). usable_balcony_or_bookable_roof is manual
-# (usable_balcony / bookable_roof) or derived from the has_roof_deck flag.
+# explicit packages_safe boolean; a VIRTUAL doorman sets it false). The
+# usable-balcony signal is driven by has_private_outdoor (real private
+# outdoor space), falling back to the weaker shared has_roof_deck flag.
 # --------------------------------------------------------------------------- #
 hygiene_outdoor:
   amenity_trap_cap: 5
@@ -173,6 +205,24 @@ hygiene_outdoor:
     quiet_enough_to_sleep: 3
     packages_safe: 2
     usable_balcony_or_bookable_roof: 3
+
+# --------------------------------------------------------------------------- #
+# Amenity flags (max 3) — small binary add-ons for the parsed building/unit
+# feature set. Each key is a derived flag name (see amenity_flags); the value
+# is the points earned when the flag is true. Keep these at 1 apiece — they
+# are presence signals layered on top of the main categories.
+# --------------------------------------------------------------------------- #
+amenity_flags_score:
+  points:
+    has_washer_dryer: 1
+    has_dishwasher: 1
+    has_central_ac: 1
+    has_private_outdoor: 1
+    has_package_room: 1
+    has_bike_room: 1
+    has_storage: 1
+    has_parking: 1
+    has_pool: 1
 
 # --------------------------------------------------------------------------- #
 # Dealbreakers — each rule matches when every `when` condition holds.
@@ -207,3 +257,13 @@ dealbreakers:
       unit_floor: {min: 5}
       has_elevator: false
       intends_to_host: true
+  - name: stale_listing_negotiate_hard
+    # sitting on the market: leverage signal, not a hard stop
+    when:
+      days_on_market: {min: 60}
+  - name: furnished_when_you_own_furniture
+    when:
+      furnished: true
+  - name: price_dropped_motivated_landlord
+    when:
+      price_dropped: true

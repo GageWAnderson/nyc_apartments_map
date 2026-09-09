@@ -280,7 +280,7 @@ def test_hygiene_full_points(card: Any) -> None:
         "usable_balcony": True,
     }
     cs = score_mod.score_hygiene_outdoor(listing, card, card.category_max["hygiene_outdoor"])
-    assert cs.points == 8
+    assert cs.points == 7  # 3 quiet + 2 packages + 3 balcony, under the 7 cap
 
 
 def test_hygiene_bookable_roof_alternative(card: Any) -> None:
@@ -397,13 +397,14 @@ def test_clean_listing_triggers_nothing(card: Any) -> None:
 # --------------------------------------------------------------------------- #
 def test_chelsea_true_1br_solo_scores_high(card: Any) -> None:
     result = score_mod.score_listing(base_listing(), card)
-    assert result.total == 28 + 28 + 15 + 15 + 8  # 94
+    assert result.total == 28 + 28 + 15 + 15 + 7  # 93 (no amenity flags set)
     assert set(result.breakdown) == {
         "location",
         "unit_function",
         "control",
         "access",
         "hygiene_outdoor",
+        "amenity_flags_score",
     }
 
 
@@ -440,7 +441,7 @@ def test_cli_prints_single_score(tmp_path: Path, capsys: Any) -> None:
     rc = score_mod.main([str(listing_file)])
     out = capsys.readouterr().out.strip()
     assert rc == 0
-    assert out == "94"
+    assert out == "93"
 
 
 def test_cli_explain_prints_breakdown(tmp_path: Path, capsys: Any) -> None:
@@ -500,18 +501,36 @@ def test_floor_from_unit_ph_falls_back_to_building_floors() -> None:
     assert score_mod.floor_from_unit("PH", None) is None
 
 
+@pytest.mark.parametrize(
+    ("unit", "floors", "expected"),
+    [
+        ("#1020", 62, 10),  # floor+line encoding: drop the trailing line digit
+        ("#219", 15, 2),
+        ("#2709", 62, 27),
+        ("#PH308", 62, 30),
+        ("#18A", 33, 18),  # already plausible: unchanged
+        ("#5A", 6, 5),
+        ("#1020", None, 1020),  # no building bound: parse as-is
+    ],
+)
+def test_floor_from_unit_bounded_by_building_floors(
+    unit: str, floors: int | None, expected: int | None
+) -> None:
+    assert score_mod.floor_from_unit(unit, floors) == expected
+
+
 def test_derive_amenity_flags_from_enum(card: Any) -> None:
     flags = score_mod.derive_amenity_flags(
         {"amenities": ["ELEVATOR", "LAUNDRY", "DOORMAN", "GYM", "ROOF_DECK"]}, card
     )
-    assert flags == {
-        "laundry_in_building": True,
-        "has_elevator": True,
-        "has_doorman": True,
-        "has_gym": True,
-        "has_roof_deck": True,
-        "has_shared_outdoor": False,
-    }
+    assert flags["laundry_in_building"] is True
+    assert flags["has_elevator"] is True
+    assert flags["has_doorman"] is True
+    assert flags["has_gym"] is True
+    assert flags["has_roof_deck"] is True
+    assert flags["has_shared_outdoor"] is False
+    assert flags["has_washer_dryer"] is False
+    assert flags["has_private_outdoor"] is False
 
 
 def test_derive_amenity_flags_accepts_json_ld_snake_case(card: Any) -> None:
@@ -589,6 +608,45 @@ def test_enrich_listing_never_overwrites_explicit(card: Any) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Amenity trap derivation + binary amenity-flag category
+# --------------------------------------------------------------------------- #
+def test_amenity_trap_derived_from_trophy_stack(card: Any) -> None:
+    listing = se_listing(amenities=["POOL", "MEDIA_ROOM", "VALET_SERVICE", "DOORMAN", "GYM"])
+    flags = score_mod.derive_amenity_flags(listing, card)
+    assert score_mod.derive_amenity_trap(listing, card, flags) is True
+
+
+def test_amenity_trap_needs_extra_flag(card: Any) -> None:
+    # 3 trophy amenities but none in the pool/valet "extra" group -> not a trap
+    listing = se_listing(amenities=["MEDIA_ROOM", "CHILDRENS_PLAYROOM"])
+    flags = score_mod.derive_amenity_flags(listing, card)
+    assert score_mod.derive_amenity_trap(listing, card, flags) is False
+
+
+def test_amenity_trap_explicit_overrides_derived(card: Any) -> None:
+    enriched = score_mod.enrich_listing(
+        se_listing(amenities=["POOL", "MEDIA_ROOM", "VALET_SERVICE"], amenity_trap=False), card
+    )
+    assert enriched["amenity_trap"] is False
+
+
+def test_score_amenity_flags_additive_and_clamped(card: Any) -> None:
+    listing = se_listing(
+        amenities=["WASHER_DRYER", "DISHWASHER", "CENTRAL_AC", "PACKAGE_ROOM", "BIKE_ROOM"]
+    )
+    enriched = score_mod.enrich_listing(listing, card)
+    cs = score_mod.score_amenity_flags(enriched, card, card.category_max["amenity_flags_score"])
+    assert cs.points == card.category_max["amenity_flags_score"]  # clamped
+    assert any("clamped" in r for r in cs.reasons)
+
+
+def test_score_amenity_flags_none_present(card: Any) -> None:
+    enriched = score_mod.enrich_listing(se_listing(amenities=[]), card)
+    cs = score_mod.score_amenity_flags(enriched, card, 10)
+    assert cs.points == 0
+
+
+# --------------------------------------------------------------------------- #
 # StreetEasy-shaped end-to-end
 # --------------------------------------------------------------------------- #
 def test_se_listing_scores_from_derived_fields_only(card: Any) -> None:
@@ -597,7 +655,9 @@ def test_se_listing_scores_from_derived_fields_only(card: Any) -> None:
     assert result.dealbreakers_triggered == []
     assert result.breakdown["access"].points == 15
     assert result.breakdown["hygiene_outdoor"].points == 5  # doorman + roof deck
-    assert result.total == 28 + 28 + 15 + 15 + 5  # 91
+    # bike room + storage + parking flags (clamped to the 3-pt category max)
+    assert result.breakdown["amenity_flags_score"].points == 3
+    assert result.total == 28 + 28 + 15 + 15 + 5 + 3  # 94
 
 
 def test_se_listing_access_works_without_floor_level(card: Any) -> None:
@@ -825,7 +885,7 @@ def test_cli_single_dict_still_single_mode(tmp_path: Path, capsys: Any) -> None:
     rc = score_mod.main([str(f)])
     out = capsys.readouterr().out.strip()
     assert rc == 0
-    assert out == "94"
+    assert out == "93"
 
 
 @pytest.mark.parametrize(
@@ -947,7 +1007,6 @@ def test_normalize_detail_omits_zero_and_empty_values() -> None:
     listing = score_mod.normalize_search_listing(entry)
     for absent in (
         "sqft",
-        "bedrooms",
         "rooms",
         "amenities",
         "building_floor_count",
@@ -955,6 +1014,10 @@ def test_normalize_detail_omits_zero_and_empty_values() -> None:
         "price",
     ):
         assert absent not in listing
+    # 0 bedrooms is a real fact (studio), not "unknown" — it is kept and
+    # inferred as a small studio layout.
+    assert listing["bedrooms"] == 0
+    assert listing["layout"] == "small_open_studio"
 
 
 def test_normalize_detail_sqft_falls_back_to_property_details() -> None:
@@ -984,6 +1047,68 @@ def test_normalize_detail_premium_omitted_at_or_below_median() -> None:
 def test_normalize_detail_explicit_premium_wins() -> None:
     listing = score_mod.normalize_search_listing(detail_entry(amenity_premium_over_comps=300))
     assert listing["amenity_premium_over_comps"] == 300
+
+
+def test_normalize_detail_flattens_unit_features_into_amenities() -> None:
+    entry = detail_entry(
+        propertyDetails_features_list=["WASHER_DRYER", "DISHWASHER", "PRIVATE_OUTDOOR_SPACE"],
+        propertyDetails_features_privateOutdoorSpaceTypes=["BALCONY"],
+    )
+    listing = score_mod.normalize_search_listing(entry)
+    for a in ("WASHER_DRYER", "DISHWASHER", "PRIVATE_OUTDOOR_SPACE", "BALCONY"):
+        assert a in listing["amenities"]
+
+
+def test_normalize_detail_private_outdoor_sets_usable_balcony() -> None:
+    entry = detail_entry(propertyDetails_features_privateOutdoorSpaceTypes=["TERRACE"])
+    listing = score_mod.normalize_search_listing(entry)
+    assert listing["usable_balcony"] is True
+
+
+def test_normalize_detail_virtual_doorman_unsets_packages_safe() -> None:
+    entry = detail_entry(propertyDetails_amenities_doormanTypes=["VIRTUAL"])
+    listing = score_mod.normalize_search_listing(entry)
+    assert listing["packages_safe"] is False
+
+
+def test_normalize_detail_maps_net_effective_and_concessions() -> None:
+    listing = score_mod.normalize_search_listing(
+        detail_entry(netEffectivePrice=5750, monthsFree=0.5, daysOnMarket=42)
+    )
+    assert listing["net_effective_rent"] == 5750
+    assert listing["months_free"] == 0.5
+    assert listing["days_on_market"] == 42
+
+
+def test_normalize_detail_detects_price_drop() -> None:
+    dropped = detail_entry(
+        pricing_priceChanges_json='[{"price": 6000, "changedAt": "x"}, {"price": 5600}]'
+    )
+    flat = detail_entry(pricing_priceChanges_json='[{"price": 6000}, {"price": 6000}]')
+    assert score_mod.normalize_search_listing(dropped)["price_dropped"] is True
+    assert "price_dropped" not in score_mod.normalize_search_listing(flat)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    [
+        ({"description": "Sunny alcove studio", "bedroomCount": 0}, "alcove_1br"),
+        ({"description": "Convertible 2BR with pressurized wall", "bedroomCount": 1}, "fake_1br"),
+        ({"description": "Junior one bedroom", "bedroomCount": 1}, "junior_1br"),
+        ({"description": "", "bedroomCount": 0, "livingAreaSize": 600}, "large_zoned_studio"),
+        ({"description": "", "bedroomCount": 0, "livingAreaSize": 380}, "small_open_studio"),
+        ({"description": "", "bedroomCount": 1}, "true_1br"),
+    ],
+)
+def test_infer_layout(overrides: dict[str, Any], expected: str) -> None:
+    entry = detail_entry(**overrides)
+    listing = score_mod.normalize_search_listing(entry)
+    assert listing["layout"] == expected
+
+
+def test_normalize_detail_explicit_layout_wins() -> None:
+    entry = detail_entry(layout="railroad")
+    assert score_mod.normalize_search_listing(entry)["layout"] == "railroad"
 
 
 def test_normalize_detail_passthrough_skips_export_noise() -> None:
@@ -1028,7 +1153,7 @@ def test_score_search_listing_detail_entry(card: Any) -> None:
     assert row.breakdown["access"].points == 6 + 4  # elevator + laundry, no transit data
     assert row.breakdown["hygiene_outdoor"].points == 2 + 3  # doorman packages + roof deck
     assert "thousand_dollar_amenity_premium" in row.dealbreakers_triggered
-    assert len(row.warnings) == 2  # layout + living_situation still missing
+    assert len(row.warnings) == 1  # living_situation still missing (layout inferred)
 
 
 def test_run_batch_dedupes_detail_entries(card: Any) -> None:
@@ -1056,5 +1181,7 @@ def test_batch_on_real_detail_export_file(card: Any) -> None:
     row = rows[0]
     assert row.address == "555 West 45th Street #2L"
     assert row.breakdown["location"].points == 21
-    assert row.total == 21 + 10 + 5  # location + access + hygiene (layout/control 0)
+    # location + access(10) + hygiene(3, private outdoor only) + unit_function(28)
+    # + amenity_flags(3, clamped); capped at 49 by the premium dealbreaker
+    assert row.total == 49
     assert "thousand_dollar_amenity_premium" in row.dealbreakers_triggered
