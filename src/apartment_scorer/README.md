@@ -35,26 +35,51 @@ A worked single-listing example lives at
 ## Batch mode
 
 When the input JSON root is an **array**, the scorer switches to batch mode.
-This is designed for StreetEasy **search-result exports** (e.g. from the
-Apify StreetEasy scraper) — one object per listing with keys like `address`,
-`price`, `bedrooms`, `squareFeet`, `propertyType`, `neighborhood`, `url`.
+This is designed for StreetEasy **exports** — one object per listing. Two
+shapes are supported and auto-detected per entry (mixed arrays work):
+
+- **Detail export** (current scraper): the flattened listing payload —
+  `street`, `displayUnit`, `listingAddress`, `areaName`, `bedroomCount`,
+  `livingAreaSize`, `propertyDetails_*`, `floorCount`, `yearBuilt`, `urlPath`,
+  `recentListingsPriceStats_*`, …
+- **Legacy search export** (Apify): `address`, `price`, `bedrooms`,
+  `squareFeet`, `propertyType`, `neighborhood`, `url`.
 
 ```bash
+uv run python src/apartment_scorer/score.py data/listings/midtown-west-7JvyChQ4hI24jJVPX/listings.json
 uv run python src/apartment_scorer/score.py data/listings/chelsea-DPMjSjjxVAsilXG9J/listings.json
 ```
 
 ```
 SCORE  ADDRESS                                    PRICE BD  LAYOUT             FLAGS
 ------------------------------------------------------------------------------------
+   36  555 West 45th Street #2L                  $6,000  1  -                  !thousand_dollar_amenity_premium ~partial
    34  311 West 19th Street #1                   $8,250  3  -                  ~partial
-   28  100 West 26th Street #18A                 $6,295  1  -                  ~partial
    ...
 42 scored · 8 deduped
 ```
 
 ### How the export maps onto the schema
 
-`normalize_search_listing()` translates each export entry:
+`normalize_search_listing()` translates each export entry. Detail export
+(current scraper):
+
+| Export key | Schema field | Notes |
+|---|---|---|
+| `listingAddress` (else `street` + `unit`/`displayUnit`) | `name` + `unit` | `#` stripped from the unit; floor parsed (`#2L`→2) |
+| `price` (else `rent`) | `price` | |
+| `bedroomCount` | `bedrooms` | `0` → omitted |
+| `propertyDetails_roomCount` | `rooms` | real room count (legacy shape approximates from bedrooms) |
+| `livingAreaSize` (else `propertyDetails_livingAreaSize`) | `sqft` | `0`/`null` (unknown) → omitted |
+| `areaName` | `neighborhood` | `"Hell's Kitchen"` scores 21 |
+| `buildingType` | `building_type` | e.g. `"RENTAL"` — informational only |
+| `propertyDetails_amenities_list` + `propertyDetails_amenities_sharedOutdoorSpaceTypes` | `amenities` | flattened + deduped; `ROOF_DECK` lives in the second list |
+| `floorCount` (else `floor_count`/`stories`) | `building_floor_count` | |
+| `yearBuilt` (else `year_built`) | `building_year_built` | `0` → omitted |
+| `urlPath` | `source_url` | relative paths prefixed with `https://streeteasy.com` |
+| `price` − `recentListingsPriceStats_rentalPriceStats_medianPrice` | `amenity_premium_over_comps` | derived only when price exceeds the area median — feeds the `$1,000` premium dealbreaker |
+
+Legacy search export (Apify):
 
 | Export key | Schema field | Notes |
 |---|---|---|
@@ -71,8 +96,9 @@ SCORE  ADDRESS                                    PRICE BD  LAYOUT             F
 Zero/empty export values mean "unknown" and are **omitted**, so derived
 flags stay false and no dealbreaker fires on absent facts. Any
 **scorer-native field already present** on an entry (e.g. a hand-completed
-`layout`, `living_situation`, `bed_in_sightline`, or a richer scraper's
-`amenities`) passes straight through, so you can enrich individual rows.
+`layout`, `living_situation`, `bed_in_sightline`, or an explicit
+`amenity_premium_over_comps`) passes straight through and wins over derived
+values, so you can enrich individual rows.
 
 ### Null-safe scoring (why every export row gets a score)
 
@@ -147,7 +173,7 @@ Two kinds of fields:
 | `usable_balcony` / `bookable_roof` | bool | Hygiene points (either); `bookable_roof: null` falls back to derived `has_roof_deck` |
 | `amenity_trap` | bool | Trophy finishes / sliver balcony / unbookable roof → hygiene capped at 5 |
 | `effective_building_class` | string | Manual override of the class heuristic |
-| `amenity_premium_over_comps` | number | $/mo above comps (dealbreaker ≥ $1,000) |
+| `amenity_premium_over_comps` | number | $/mo above comps (dealbreaker ≥ $1,000); auto-derived from detail exports' `recentListingsPriceStats` when price exceeds the area median |
 | `relying_on_common_space` | bool | Lounge/roof as substitute living room (dealbreaker) |
 | `intends_to_host` | bool | Gates the 5-flight walk-up dealbreaker |
 

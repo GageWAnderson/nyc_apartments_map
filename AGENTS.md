@@ -47,14 +47,20 @@ message on commit. To run the full suite manually:
   browser-saved). Tests: `tests/test_apartment_scorer.py` (logic-only;
   imports `apartment_scorer.score` via the editable install's `src/` path);
   smoke fixture at `tests/data/test_listing.json`. When the input JSON root
-  is an **array**, the same CLI runs **batch mode** for StreetEasy
-  search-result exports (Apify shape: `address`/`price`/`bedrooms`/
-  `squareFeet`/`neighborhood`/`url`): `normalize_search_listing()` maps the
-  export (zero/empty = unknown → omitted; scorer-native fields pass through),
-  dedupes on address+price (featured/infeed URLs collapse), scores
-  **null-safely** (missing `layout`/`living_situation` → that category 0 +
-  warning, row still ranks), and prints a ranked table (`--json PATH` dumps
-  full breakdowns). Sample export under `data/listings/`.
+  is an **array**, the same CLI runs **batch mode** for StreetEasy exports.
+  Two shapes are auto-detected per entry (mixed arrays work): the current
+  scraper's flattened **detail payload** (`street`/`listingAddress`/
+  `areaName`/`bedroomCount`/`livingAreaSize`/`propertyDetails_*`/`floorCount`/
+  `urlPath`/`recentListingsPriceStats_*`) and the **legacy Apify search
+  export** (`address`/`price`/`bedrooms`/`squareFeet`/`neighborhood`/`url`).
+  `normalize_search_listing()` maps either shape (zero/empty = unknown →
+  omitted; `amenities` flattens `amenities_list` + `sharedOutdoorSpaceTypes`;
+  `amenity_premium_over_comps` is derived as price − area-median rent when
+  positive; scorer-native fields pass through and win), dedupes on
+  address+price (featured/infeed URLs collapse), scores **null-safely**
+  (missing `layout`/`living_situation` → that category 0 + warning, row still
+  ranks), and prints a ranked table (`--json PATH` dumps full breakdowns).
+  Sample exports under `data/listings/`.
 
 ## Quality checks
 

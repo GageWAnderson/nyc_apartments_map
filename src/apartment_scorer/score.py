@@ -627,7 +627,7 @@ def _split_address_unit(address: str) -> tuple[str, str | None]:
     return text, None
 
 
-# Keys in the StreetEasy search-export shape that are already mapped (or are
+# Keys in the legacy search-export shape that are already mapped (or are
 # export-only noise) and therefore excluded from the generic passthrough.
 _EXPORT_KEYS = {
     "address",
@@ -654,15 +654,243 @@ _EXPORT_KEYS = {
     "url",
 }
 
+# Keys in the flattened detail-export shape (new scraper) that are explicitly
+# mapped (or are export-only noise) and therefore excluded from the generic
+# passthrough. Prefixed families (pricing_*, propertyDetails_*, ...) and
+# *_json blobs are excluded by _is_export_noise instead of being listed here.
+_DETAIL_EXPORT_KEYS = {
+    # identity / listing meta
+    "id",
+    "listingId",
+    "propertyId",
+    "buildingId",
+    "slug",
+    "state",
+    "tier",
+    "partial",
+    "mlsNumber",
+    "saleType",
+    "hasFinancialData",
+    "originalSearchUrl",
+    "createdAt",
+    "updatedAt",
+    "interestingPriceDelta",
+    "interestingChangeAt",
+    "isNewDevelopment",
+    "isPremiumHdpEnabled",
+    "hasTour3d",
+    "hasVideos",
+    "furnished",
+    # address / geo
+    "areaName",
+    "street",
+    "displayUnit",
+    "unit",
+    "listingAddress",
+    "urlPath",
+    "zipCode",
+    "geoPoint_latitude",
+    "geoPoint_longitude",
+    # unit facts (mapped)
+    "bedroomCount",
+    "fullBathroomCount",
+    "halfBathroomCount",
+    "livingAreaSize",
+    "buildingType",
+    # pricing (mapped: price/rent; the rest is context noise)
+    "rent",
+    "totalMonthlyPrice",
+    "leaseTermMonths",
+    "monthsFree",
+    "netEffectivePrice",
+    "lease_term_months",
+    "months_free",
+    "net_effective_rent",
+    "security_deposit",
+    "due_up_front",
+    "furnished_rent",
+    "monthlyFees",
+    "additionalFees",
+    "monthly_taxes",
+    "monthly_fees",
+    "maintenance",
+    "soldPrice",
+    "sold_price",
+    "sold_date",
+    # building facts (mapped)
+    "year_built",
+    "floorCount",
+    "floor_count",
+    "stories",
+    "residentialUnitCount",
+    "residential_unit_count",
+    # market context (median rent feeds amenity_premium_over_comps)
+    "availableAt",
+    "onMarketAt",
+    "offMarketAt",
+    "daysOnMarket",
+    "on_market_at",
+    "off_market_at",
+    "days_on_market",
+    "upcomingOpenHouse",
+    "upcomingOpenHouses",
+    "userListingDetails",
+    "sourceGroupLabel",
+    "sourceType",
+    "source_group_label",
+    "images",
+    "contactEmail",
+    "contactWebsite",
+    "recentListingsPriceStats_bedroomCount",
+    "recentListingsPriceStats_rentalPriceStats_maxPrice",
+    "recentListingsPriceStats_rentalPriceStats_medianPrice",
+    "recentListingsPriceStats_rentalPriceStats_minPrice",
+    "recentListingsPriceStats_rentalPriceStats_numListings",
+    "recentListingsPriceStats_salePriceStats_maxPrice",
+    "recentListingsPriceStats_salePriceStats_medianPrice",
+    "recentListingsPriceStats_salePriceStats_minPrice",
+    "recentListingsPriceStats_salePriceStats_numListings",
+}
 
-def normalize_search_listing(raw: dict[str, Any]) -> Listing:
-    """Map a StreetEasy search-result export entry onto the scorer's input schema.
+# Prefixed key families in the detail export that never map onto the scorer
+# schema (nested payload dumps, agent/license/media blobs).
+_DETAIL_NOISE_PREFIXES = (
+    "pricing_",
+    "propertyDetails_",
+    "media_",
+    "license_",
+    "listingSource_",
+    "latestListing_",
+    "agentsInfo_",
+    "emailEnrichment_",
+)
 
-    Zero/empty export values mean "unknown" and are omitted so derived flags
-    simply stay false and no dealbreaker fires on absent facts. Fields the
-    export never carries (layout, living_situation, tour judgments) are left
-    out entirely — the batch scorer treats them as null-safe zeros.
+
+def _is_export_noise(key: str) -> bool:
+    """True for export keys that must not pass through into the listing."""
+    return (
+        key in _EXPORT_KEYS
+        or key in _DETAIL_EXPORT_KEYS
+        or key.endswith("_json")
+        or key.startswith(_DETAIL_NOISE_PREFIXES)
+    )
+
+
+def _is_detail_export(raw: dict[str, Any]) -> bool:
+    """True for the flattened detail payload (new scraper), False for legacy."""
+    return any(key in raw for key in ("street", "listingAddress", "areaName"))
+
+
+def _first_positive_number(raw: dict[str, Any], *keys: str) -> int | float | None:
+    """First key holding a positive number; 0/None/negative mean "unknown"."""
+    for key in keys:
+        value = raw.get(key)
+        if isinstance(value, int | float) and not isinstance(value, bool) and value > 0:
+            return value
+    return None
+
+
+def _detail_unit(raw: dict[str, Any]) -> str | None:
+    """Unit designator from the detail export's `unit`/`displayUnit` ('#2L' -> '2L')."""
+    for key in ("unit", "displayUnit"):
+        value = raw.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip().lstrip("#") or None
+    return None
+
+
+def _normalize_detail_export(raw: dict[str, Any]) -> Listing:
+    """Map a flattened StreetEasy detail-payload entry onto the scorer's schema.
+
+    Same contract as the legacy mapping: zero/empty export values mean
+    "unknown" and are omitted. Notable differences from the legacy shape:
+
+    - `rooms` is the real `propertyDetails_roomCount` (not bedroomsapproximated).
+    - `amenities` flattens `propertyDetails_amenities_list` +
+      `sharedOutdoorSpaceTypes` (where ROOF_DECK lives), deduped in order.
+    - `amenity_premium_over_comps` is derived as
+      `price - recentListingsPriceStats_rentalPriceStats_medianPrice` when the
+      price exceeds the area median (an explicit value on the entry wins).
     """
+    listing: Listing = {}
+
+    unit = _detail_unit(raw)
+    address = raw.get("listingAddress")
+    if isinstance(address, str) and address.strip():
+        _, parsed_unit = _split_address_unit(address)
+        listing["name"] = address.strip()
+        unit = parsed_unit or unit
+    else:
+        street = raw.get("street")
+        if isinstance(street, str) and street.strip():
+            name = street.strip()
+            if unit:
+                name = f"{name} #{unit}"
+            listing["name"] = name
+    if unit:
+        listing["unit"] = unit
+
+    price = _first_positive_number(raw, "price", "rent")
+    if price is not None:
+        listing["price"] = price
+    bedrooms = _first_positive_number(raw, "bedroomCount", "propertyDetails_bedroomCount")
+    if bedrooms is not None:
+        listing["bedrooms"] = bedrooms
+    rooms = _first_positive_number(raw, "propertyDetails_roomCount")
+    if rooms is not None:
+        listing["rooms"] = rooms
+    sqft = _first_positive_number(raw, "livingAreaSize", "propertyDetails_livingAreaSize")
+    if sqft is not None:
+        listing["sqft"] = sqft
+
+    neighborhood = raw.get("areaName")
+    if isinstance(neighborhood, str) and neighborhood.strip():
+        listing["neighborhood"] = neighborhood.strip()
+    building_type = raw.get("buildingType")
+    if isinstance(building_type, str) and building_type.strip():
+        listing["building_type"] = building_type.strip()
+
+    amenities: list[str] = []
+    for key in (
+        "propertyDetails_amenities_list",
+        "propertyDetails_amenities_sharedOutdoorSpaceTypes",
+    ):
+        values = raw.get(key)
+        if isinstance(values, list):
+            for value in values:
+                if isinstance(value, str) and value and value not in amenities:
+                    amenities.append(value)
+    if amenities:
+        listing["amenities"] = amenities
+
+    floors = _first_positive_number(raw, "floorCount", "floor_count", "stories")
+    if floors is not None:
+        listing["building_floor_count"] = floors
+    year = _first_positive_number(raw, "yearBuilt", "year_built")
+    if year is not None:
+        listing["building_year_built"] = year
+
+    url_path = raw.get("urlPath")
+    if isinstance(url_path, str) and url_path.strip():
+        url = url_path.strip()
+        if url.startswith("/"):
+            url = "https://streeteasy.com" + url
+        listing["source_url"] = url
+
+    median = raw.get("recentListingsPriceStats_rentalPriceStats_medianPrice")
+    if (
+        price is not None
+        and isinstance(median, int | float)
+        and not isinstance(median, bool)
+        and 0 < median < price
+        and "amenity_premium_over_comps" not in raw
+    ):
+        listing["amenity_premium_over_comps"] = price - median
+    return listing
+
+
+def _normalize_legacy_export(raw: dict[str, Any]) -> Listing:
+    """Map a legacy Apify search-result export entry onto the scorer's schema."""
     listing: Listing = {}
     address = raw.get("address")
     if isinstance(address, str) and address.strip():
@@ -694,10 +922,32 @@ def normalize_search_listing(raw: dict[str, Any]) -> Listing:
     year_built = raw.get("yearBuilt")
     if isinstance(year_built, (int, float)) and not isinstance(year_built, bool) and year_built > 0:
         listing["building_year_built"] = year_built
+    return listing
+
+
+def normalize_search_listing(raw: dict[str, Any]) -> Listing:
+    """Map a StreetEasy export entry onto the scorer's input schema.
+
+    Two export shapes are supported and auto-detected:
+
+    - **Detail export** (current scraper): the flattened listing payload with
+      `street`/`listingAddress`/`areaName`/`propertyDetails_*` keys.
+    - **Legacy search export** (Apify): `address`/`price`/`bedrooms`/
+      `squareFeet`/`neighborhood`/`url`.
+
+    Zero/empty export values mean "unknown" and are omitted so derived flags
+    simply stay false and no dealbreaker fires on absent facts. Fields the
+    export never carries (layout, living_situation, tour judgments) are left
+    out entirely — the batch scorer treats them as null-safe zeros.
+    """
+    if _is_detail_export(raw):
+        listing = _normalize_detail_export(raw)
+    else:
+        listing = _normalize_legacy_export(raw)
     # Pass through any scorer-native fields already present (lets an export be
     # hand-completed or produced by a richer scraper without losing fields).
     for key, value in raw.items():
-        if key not in _EXPORT_KEYS and key not in listing:
+        if not _is_export_noise(key) and key not in listing:
             listing[key] = value
     return listing
 

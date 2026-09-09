@@ -858,3 +858,203 @@ def test_normalize_passthrough_skips_export_noise() -> None:
     listing = score_mod.normalize_search_listing(search_entry())
     for noise in ("maintenanceFee", "taxes", "pricePerSqFt", "agentBrokerage", "description"):
         assert noise not in listing
+
+
+# --------------------------------------------------------------------------- #
+# Batch mode: flattened StreetEasy detail exports (new scraper shape)
+# --------------------------------------------------------------------------- #
+_DETAIL_FILE = (
+    Path(__file__).resolve().parents[1]
+    / "data"
+    / "listings"
+    / "midtown-west-7JvyChQ4hI24jJVPX"
+    / "listings.json"
+)
+
+
+def detail_entry(**overrides: Any) -> dict[str, Any]:
+    """Flattened StreetEasy detail payload (midtown-west scrape, trimmed)."""
+    entry: dict[str, Any] = {
+        "id": "5150255",
+        "areaName": "Hell's Kitchen",
+        "bedroomCount": 1,
+        "buildingType": "RENTAL",
+        "fullBathroomCount": 1,
+        "halfBathroomCount": 0,
+        "livingAreaSize": 0,
+        "monthsFree": 0.5,
+        "netEffectivePrice": 5750,
+        "price": 6000,
+        "street": "555 West 45th Street",
+        "displayUnit": "#2L",
+        "unit": "#2L",
+        "urlPath": "/building/555-west-45-street/2l",
+        "listingAddress": "555 West 45th Street #2L",
+        "floorCount": 7,
+        "yearBuilt": 2025,
+        "propertyDetails_roomCount": 5,
+        "propertyDetails_amenities_list": ["DOORMAN", "ELEVATOR", "GYM", "LAUNDRY"],
+        "propertyDetails_amenities_sharedOutdoorSpaceTypes": ["COURTYARD", "ROOF_DECK"],
+        "recentListingsPriceStats_rentalPriceStats_medianPrice": 4995,
+        "photos_json": '[{"key": "abc"}]',
+        "agents_json": '[{"name": "Agent"}]',
+    }
+    entry.update(overrides)
+    return entry
+
+
+# --- normalize_search_listing (detail shape) ------------------------------- #
+def test_normalize_detail_maps_export_fields() -> None:
+    listing = score_mod.normalize_search_listing(detail_entry())
+    assert listing["name"] == "555 West 45th Street #2L"
+    assert listing["unit"] == "2L"
+    assert listing["price"] == 6000
+    assert listing["bedrooms"] == 1
+    assert listing["rooms"] == 5  # real roomCount, not the bedrooms approximation
+    assert listing["neighborhood"] == "Hell's Kitchen"
+    assert listing["building_type"] == "RENTAL"
+    assert listing["source_url"] == "https://streeteasy.com/building/555-west-45-street/2l"
+    assert listing["building_floor_count"] == 7
+    assert listing["building_year_built"] == 2025
+
+
+def test_normalize_detail_flattens_amenity_sources() -> None:
+    listing = score_mod.normalize_search_listing(detail_entry())
+    assert listing["amenities"] == [
+        "DOORMAN",
+        "ELEVATOR",
+        "GYM",
+        "LAUNDRY",
+        "COURTYARD",
+        "ROOF_DECK",
+    ]
+
+
+def test_normalize_detail_omits_zero_and_empty_values() -> None:
+    entry = detail_entry(
+        livingAreaSize=0,
+        propertyDetails_livingAreaSize=None,
+        bedroomCount=0,
+        propertyDetails_bedroomCount=0,
+        propertyDetails_roomCount=0,
+        propertyDetails_amenities_list=[],
+        propertyDetails_amenities_sharedOutdoorSpaceTypes=[],
+        floorCount=0,
+        yearBuilt=0,
+        price=0,
+        rent=0,
+    )
+    listing = score_mod.normalize_search_listing(entry)
+    for absent in (
+        "sqft",
+        "bedrooms",
+        "rooms",
+        "amenities",
+        "building_floor_count",
+        "building_year_built",
+        "price",
+    ):
+        assert absent not in listing
+
+
+def test_normalize_detail_sqft_falls_back_to_property_details() -> None:
+    entry = detail_entry(livingAreaSize=0, propertyDetails_livingAreaSize=700)
+    listing = score_mod.normalize_search_listing(entry)
+    assert listing["sqft"] == 700
+
+
+def test_normalize_detail_composes_name_without_listing_address() -> None:
+    entry = detail_entry()
+    del entry["listingAddress"]
+    listing = score_mod.normalize_search_listing(entry)
+    assert listing["name"] == "555 West 45th Street #2L"
+    assert listing["unit"] == "2L"
+
+
+def test_normalize_detail_derives_amenity_premium_over_comps() -> None:
+    listing = score_mod.normalize_search_listing(detail_entry())
+    assert listing["amenity_premium_over_comps"] == 6000 - 4995
+
+
+def test_normalize_detail_premium_omitted_at_or_below_median() -> None:
+    listing = score_mod.normalize_search_listing(detail_entry(price=4995))
+    assert "amenity_premium_over_comps" not in listing
+
+
+def test_normalize_detail_explicit_premium_wins() -> None:
+    listing = score_mod.normalize_search_listing(detail_entry(amenity_premium_over_comps=300))
+    assert listing["amenity_premium_over_comps"] == 300
+
+
+def test_normalize_detail_passthrough_skips_export_noise() -> None:
+    entry = detail_entry()
+    entry["layout"] = "true_1br"
+    entry["living_situation"] = "solo"
+    listing = score_mod.normalize_search_listing(entry)
+    assert listing["layout"] == "true_1br"
+    assert listing["living_situation"] == "solo"
+    for noise in (
+        "photos_json",
+        "agents_json",
+        "areaName",
+        "street",
+        "urlPath",
+        "propertyDetails_roomCount",
+        "propertyDetails_amenities_list",
+        "recentListingsPriceStats_rentalPriceStats_medianPrice",
+        "pricing_monthsFree",
+        "media_videos",
+    ):
+        assert noise not in listing
+
+
+# --- derived fields from the detail shape ----------------------------------- #
+def test_detail_amenities_drive_derived_flags(card: Any) -> None:
+    enriched = score_mod.enrich_listing(score_mod.normalize_search_listing(detail_entry()), card)
+    assert enriched["has_doorman"] is True
+    assert enriched["has_elevator"] is True
+    assert enriched["laundry_in_building"] is True
+    assert enriched["has_roof_deck"] is True  # via sharedOutdoorSpaceTypes
+    assert enriched["unit_floor"] == 2
+    assert enriched["effective_building_class"] == "elevator_building"  # 7 floors < 20
+
+
+def test_score_search_listing_detail_entry(card: Any) -> None:
+    row = score_mod.score_search_listing(detail_entry(), card)
+    assert row.address == "555 West 45th Street #2L"
+    assert row.price == 6000
+    assert row.bedrooms == 1
+    assert row.breakdown["location"].points == 21  # Hell's Kitchen
+    assert row.breakdown["access"].points == 6 + 4  # elevator + laundry, no transit data
+    assert row.breakdown["hygiene_outdoor"].points == 2 + 3  # doorman packages + roof deck
+    assert "thousand_dollar_amenity_premium" in row.dealbreakers_triggered
+    assert len(row.warnings) == 2  # layout + living_situation still missing
+
+
+def test_run_batch_dedupes_detail_entries(card: Any) -> None:
+    rows, dupes = score_mod.run_batch(
+        [detail_entry(), detail_entry(urlPath="/building/555-west-45-street/2l?featured=1")], card
+    )
+    assert len(rows) == 1
+    assert dupes == 1
+
+
+def test_run_batch_mixed_shapes(card: Any) -> None:
+    rows, _ = score_mod.run_batch([search_entry(), detail_entry()], card)
+    assert {r.address for r in rows} == {
+        "100 West 26th Street #18A",
+        "555 West 45th Street #2L",
+    }
+
+
+# --- real export file ------------------------------------------------------- #
+@pytest.mark.skipif(not _DETAIL_FILE.exists(), reason="detail export not present")
+def test_batch_on_real_detail_export_file(card: Any) -> None:
+    raw = json.loads(_DETAIL_FILE.read_text())
+    rows, _ = score_mod.run_batch(raw, card)
+    assert len(rows) == len(raw) == 1
+    row = rows[0]
+    assert row.address == "555 West 45th Street #2L"
+    assert row.breakdown["location"].points == 21
+    assert row.total == 21 + 10 + 5  # location + access + hygiene (layout/control 0)
+    assert "thousand_dollar_amenity_premium" in row.dealbreakers_triggered
