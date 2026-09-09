@@ -30,7 +30,12 @@ batch mode those score 0 with a warning instead (see below).
 
 A worked single-listing example lives at
 [`tests/data/test_listing.json`](../../tests/data/test_listing.json)
-(Chelsea Tower #18A, from a real StreetEasy listing).
+(Chelsea Tower #18A, from a real StreetEasy listing). It is stored as a
+single-entry **detail export** array, so it runs through the batch path:
+
+```bash
+uv run python src/apartment_scorer/score.py tests/data/test_listing.json --explain
+```
 
 ## Batch mode
 
