@@ -59,8 +59,21 @@ message on commit. To run the full suite manually:
   positive; scorer-native fields pass through and win), dedupes on
   address+price (featured/infeed URLs collapse), scores **null-safely**
   (missing `layout`/`living_situation` → that category 0 + warning, row still
-  ranks), and prints a ranked table (`--json PATH` dumps full breakdowns).
-  Sample exports under `data/listings/`.
+   ranks), and prints a ranked table (`--json PATH` dumps full breakdowns).
+   Sample exports under `data/listings/`.
+- `src/streeteasy_scraper/` is a standalone PoC (argparse CLI, no pipeline
+  dependency) that runs the Apify actor `memo23/streeteasy-ppr`
+  (`ptsXZUXADV3OKZ5kd`) and writes the dataset to
+  `data/listings/<label>-<run_id>/listings.json` (the batch input shape for
+  `apartment_scorer`). `APIFY_TOKEN` comes from the repo `.env` via
+  `python-dotenv` (real env wins) — note `Settings` does NOT define it, the
+  script reads `os.environ` directly. `DEFAULT_INPUT` in `scrape.py` is the
+  known-good input from console run `XlM3kuadfmTmPaatE`; `--url`/`--max-items`
+  override pieces, `--input-json` replaces it, `--no-wait` uses `.start()`
+  and `--from-run` downloads an existing run's dataset. apify-client v3
+  returns pydantic `Run` models (snake_case attrs: `run.id`,
+  `run.default_dataset_id`), NOT dicts, and `.call()` takes
+  `wait_duration=timedelta(...)` — no `timeout_secs` kwarg.
 
 ## Quality checks
 
